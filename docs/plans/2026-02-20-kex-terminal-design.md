@@ -303,8 +303,8 @@ Spec（设计文档/接口定义）
 
 - 方式：`git subtree split`（保留 commit 历史，未来可迁移到文件复制方案）
 - 触发：`main` 分支 `cli/` 目录变更时自动执行
-- 认证：GitHub Deploy Key（仅限 kex-terminal 仓库写权限）
-- 安全：同步前检查敏感文件，`cli/` 中禁止放任何闭源内容
+- 认证：Fine-grained PAT（仅限 kex-terminal 仓库 contents:write 权限），存为 `SYNC_PAT` secret
+- 安全：`cli/` 中禁止放任何闭源内容
 
 ### 11.3 CI/CD 流水线
 
