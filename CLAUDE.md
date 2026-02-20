@@ -1,5 +1,7 @@
 # kex-terminal
 
+> A modern terminal multiplexer, reimagined.
+
 ## 项目概述
 
 kex-terminal 是一个现代化的终端多路复用器（类 tmux），采用 Rust 构建。它是 kex 产品的开源 CLI 部分，配套闭源 SaaS 平台 `kex-terminal-cloud` 提供 Web 远程终端体验。
