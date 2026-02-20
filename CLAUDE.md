@@ -54,9 +54,6 @@ kex-terminal/
 │   ├── schemas/          ← JSON Schema 定义
 │   ├── fixtures/         ← 跨项目测试用例
 │   └── tests/            ← Schema 验证测试
-├── docs/
-│   ├── research/         ← 调研文档
-│   └── plans/            ← 设计文档
 └── CLAUDE.md             ← 本文件
 ```
 
@@ -64,12 +61,7 @@ kex-terminal/
 
 - **kex-terminal-cloud**（闭源）：SaaS 平台，包含 Cloudflare Workers 后端 + React Web 前端
 - 两个项目通过 `protocol/` 中的 JSON Schema 协作，面向协议编程
-
-## 设计文档索引
-
-- [快捷键设计调研](docs/research/keybinding-research.md)
-- [Web 前端技术栈调研](docs/research/web-frontend-stack.md)
-- [整体设计方案](docs/plans/2026-02-20-kex-terminal-design.md)（待创建）
+- 设计文档和调研文档统一维护在 kex-terminal-cloud 的 `docs/` 目录中（不同步到本仓库）
 
 ## CLAUDE.md 维护规则
 
