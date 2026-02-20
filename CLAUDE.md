@@ -9,14 +9,14 @@ kex-terminal 是一个现代化的终端多路复用器（类 tmux），采用 R
 ## 核心设计理念
 
 ### 资源模型（与 tmux 的关键区别）
-- **终端实例与视图解耦**：终端实例是扁平的池，workspace 是纯视图配置
-- **两层而非四层**：只有 terminal + workspace，没有 tmux 的 session → window → pane 层级
-- **同一终端可出现在多个 workspace 中**
-- **临时 workspace**：创建终端时自动分配默认视图并进入，无需手动管理
+- **终端实例与视图解耦**：终端实例是扁平的池，view 是纯视图配置
+- **两层而非四层**：只有 terminal + view，没有 tmux 的 session → window → pane 层级
+- **同一终端可出现在多个 view 中**
+- **临时 view**：创建终端时自动分配默认视图并进入，无需手动管理
 
 ### 命令设计
 - Docker 风格：`kex <资源> <动作> [参数]`
-- 示例：`kex terminal create`, `kex workspace list`
+- 示例：`kex terminal create`, `kex view ls`
 
 ### 快捷键
 - 轻量模式系统：只有 Normal（输入传递终端）和 Command（kex 接管）两个模式
