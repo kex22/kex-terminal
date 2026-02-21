@@ -26,8 +26,15 @@ kex-terminal 是一个现代化的终端多路复用器（类 tmux），采用 R
 ## 技术栈
 
 - **语言**：Rust
+- **TUI 渲染**：`crossterm`（终端操作：raw mode、光标、事件读取）+ `vt100`（虚拟终端解析器，维护屏幕缓冲区）
+- **异步运行时**：tokio（多线程）
+- **PTY**：`portable-pty`（跨平台伪终端）
 - **协议格式**：JSON Schema（跨项目共享，位于 `protocol/` 目录）
 - **版本兼容**：消息信封 + 版本号，多版本 schema 并存
+
+### TUI 架构决策
+
+不使用 ratatui 等高层 TUI 框架。原因：终端多路复用器需要将 PTY 的原始转义序列解析到虚拟屏幕缓冲区（vt100），再重新渲染到物理屏幕的子区域。高层框架的 widget 模型无法处理这种场景。
 
 ## 开发流程
 
@@ -51,7 +58,14 @@ kex-terminal 是一个现代化的终端多路复用器（类 tmux），采用 R
 
 ```
 kex-terminal/
-├── src/                  ← Rust 源码
+├── src/
+│   ├── ipc/              ← IPC 通信（Unix socket、消息编解码）
+│   ├── server/           ← Server 守护进程（daemon、PID 管理）
+│   ├── terminal/         ← 终端管理（PTY、attach、生命周期）
+│   └── tui/              ← TUI 渲染层（crossterm + vt100）
+│       ├── vterm.rs      ← 虚拟终端缓冲（vt100 封装 + dirty tracking）
+│       ├── screen.rs     ← 屏幕区域管理（Rect、pane/status bar 划分）
+│       └── renderer.rs   ← 渲染器（全量/差量行级渲染）
 ├── protocol/
 │   ├── schemas/          ← JSON Schema 定义
 │   ├── fixtures/         ← 跨项目测试用例

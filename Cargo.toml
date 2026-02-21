@@ -13,6 +13,9 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 portable-pty = "0.9"
 libc = "0.2"
+crossterm = { version = "0.29", features = ["event-stream"] }
+vt100 = "0.16"
+futures-lite = "2"
 
 [dev-dependencies]
 tempfile = "3"
