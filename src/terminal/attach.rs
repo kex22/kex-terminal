@@ -15,7 +15,14 @@ use crate::tui::vterm::VirtualTerminal;
 
 pub async fn attach(mut stream: UnixStream, terminal_name: &str) -> Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    write_message(&mut stream, &StreamMessage::Resize { cols, rows }).await?;
+    // Send pane-area size (excluding status bar) to PTY
+    let screen = Screen::new(rows, cols);
+    let pane = screen.pane_area();
+    write_message(
+        &mut stream,
+        &StreamMessage::Resize { cols: pane.width, rows: pane.height },
+    )
+    .await?;
 
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -133,7 +140,7 @@ fn key_event_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
     match event.code {
         KeyCode::Char(c) if ctrl => {
-            let byte = (c as u8).wrapping_sub(b'a').wrapping_add(1);
+            let byte = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
             Some(vec![byte])
         }
         KeyCode::Char(c) => {

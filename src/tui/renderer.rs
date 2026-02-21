@@ -71,8 +71,8 @@ impl<W: Write> Renderer<W> {
         use crossterm::style::{Attribute, SetAttribute};
         self.writer.queue(MoveTo(area.x, area.y))?;
         self.writer.queue(SetAttribute(Attribute::Reverse))?;
-        let padded: String = if text.len() >= area.width as usize {
-            text[..area.width as usize].to_string()
+        let padded: String = if text.chars().count() >= area.width as usize {
+            text.chars().take(area.width as usize).collect()
         } else {
             format!("{:<width$}", text, width = area.width as usize)
         };

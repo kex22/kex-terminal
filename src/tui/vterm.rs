@@ -33,6 +33,7 @@ impl VirtualTerminal {
         use std::hash::{Hash, Hasher};
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
+        debug_assert_eq!(self.prev_row_hashes.len(), rows as usize);
         let mut dirty = Vec::new();
         for r in 0..rows {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
