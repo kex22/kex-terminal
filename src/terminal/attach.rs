@@ -11,7 +11,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use crate::error::Result;
 use crate::ipc::client::IpcClient;
 use crate::ipc::codec::{read_message, write_message};
-use crate::ipc::message::{Request, Response, StreamMessage};
+use crate::ipc::message::{Request, Response, StreamMessage, ViewInfo};
 use crate::tui::input::{Action, InputHandler};
 use crate::tui::layout::{PaneLayout, SplitDirection};
 use crate::tui::renderer::Renderer;
@@ -391,8 +391,6 @@ async fn handle_resize(
     render_all_panes(renderer, layout, vterms, screen, input, terminal_name)?;
     Ok(())
 }
-
-use crate::ipc::message::ViewInfo;
 
 async fn fetch_view_list_text() -> Result<String> {
     let mut client = IpcClient::connect().await?;

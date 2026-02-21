@@ -194,13 +194,14 @@ async fn handle_connection(
             } else {
                 drop(mgr);
                 let mut vmgr = view_manager.lock().await;
-                if vmgr.get(&view_id).is_none() {
-                    Response::Error {
-                        message: format!("view not found: {view_id}"),
+                match vmgr.resolve_id(&view_id) {
+                    Some(resolved) => {
+                        vmgr.add_terminal(&resolved, &terminal_id);
+                        Response::Ok
                     }
-                } else {
-                    vmgr.add_terminal(&view_id, &terminal_id);
-                    Response::Ok
+                    None => Response::Error {
+                        message: format!("view not found: {view_id}"),
+                    },
                 }
             }
         }

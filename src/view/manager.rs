@@ -57,7 +57,8 @@ impl ViewManager {
     }
 
     pub fn list(&self) -> Vec<ViewInfo> {
-        self.views
+        let mut views: Vec<ViewInfo> = self
+            .views
             .values()
             .map(|v| ViewInfo {
                 id: v.id.clone(),
@@ -65,7 +66,9 @@ impl ViewManager {
                 terminal_ids: v.terminal_ids.clone(),
                 created_at: v.created_at.clone(),
             })
-            .collect()
+            .collect();
+        views.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        views
     }
 
     pub fn get(&self, id_or_name: &str) -> Option<&View> {
