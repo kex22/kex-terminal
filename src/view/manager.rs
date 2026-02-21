@@ -110,6 +110,8 @@ fn chrono_now() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as libc::time_t;
+    // SAFETY: `localtime_r` is reentrant and writes to our stack-allocated `tm`.
+    // `secs` is a valid timestamp derived from SystemTime.
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&secs, &mut tm);

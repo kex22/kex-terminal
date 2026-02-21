@@ -127,7 +127,11 @@ async fn handle_connection(
         Request::TerminalKill { id } => {
             let mut mgr = manager.lock().await;
             match mgr.kill(&id) {
-                Ok(()) => Response::Ok,
+                Ok(()) => {
+                    let mut vmgr = view_manager.lock().await;
+                    vmgr.remove_terminal(&id);
+                    Response::Ok
+                }
                 Err(e) => Response::Error {
                     message: e.to_string(),
                 },
@@ -137,9 +141,17 @@ async fn handle_connection(
             return handle_attach(stream, manager, &id).await;
         }
         Request::ViewCreate { name, terminal_id } => {
-            let mut vmgr = view_manager.lock().await;
-            let id = vmgr.create(name, terminal_id);
-            Response::ViewCreated { id }
+            let mgr = manager.lock().await;
+            if mgr.get(&terminal_id).is_none() {
+                Response::Error {
+                    message: format!("terminal not found: {terminal_id}"),
+                }
+            } else {
+                drop(mgr);
+                let mut vmgr = view_manager.lock().await;
+                let id = vmgr.create(name, terminal_id);
+                Response::ViewCreated { id }
+            }
         }
         Request::ViewList => {
             let vmgr = view_manager.lock().await;

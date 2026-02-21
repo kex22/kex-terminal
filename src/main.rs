@@ -61,7 +61,7 @@ enum TerminalAction {
 
 #[derive(Subcommand)]
 enum ViewAction {
-    /// Create a named view
+    /// Create a new view
     Create {
         /// View name
         #[arg(long)]
