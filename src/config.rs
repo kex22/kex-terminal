@@ -199,5 +199,4 @@ status_bar = false
     fn invalid_toml_errors() {
         assert!(Config::from_toml("not valid toml [[[").is_err());
     }
-
 }

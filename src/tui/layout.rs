@@ -40,10 +40,17 @@ impl PaneLayout {
         serde_json::to_value(&self.root).unwrap_or_default()
     }
 
-    pub fn from_value(v: serde_json::Value, focused: Option<&str>, fallback_terminal: &str) -> Self {
-        let root: LayoutNode = serde_json::from_value(v)
-            .unwrap_or(LayoutNode::Leaf { terminal_id: fallback_terminal.to_string() });
-        let focused = focused.unwrap_or_else(|| Self::first_leaf(&root)).to_string();
+    pub fn from_value(
+        v: serde_json::Value,
+        focused: Option<&str>,
+        fallback_terminal: &str,
+    ) -> Self {
+        let root: LayoutNode = serde_json::from_value(v).unwrap_or(LayoutNode::Leaf {
+            terminal_id: fallback_terminal.to_string(),
+        });
+        let focused = focused
+            .unwrap_or_else(|| Self::first_leaf(&root))
+            .to_string();
         Self { root, focused }
     }
 

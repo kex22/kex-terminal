@@ -46,12 +46,24 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     Ok,
-    Error { message: String },
-    TerminalCreated { id: String },
-    TerminalList { terminals: Vec<TerminalInfo> },
-    ViewCreated { id: String },
-    ViewList { views: Vec<ViewInfo> },
-    ViewShow { view: ViewInfo },
+    Error {
+        message: String,
+    },
+    TerminalCreated {
+        id: String,
+    },
+    TerminalList {
+        terminals: Vec<TerminalInfo>,
+    },
+    ViewCreated {
+        id: String,
+    },
+    ViewList {
+        views: Vec<ViewInfo>,
+    },
+    ViewShow {
+        view: ViewInfo,
+    },
     ViewAttach {
         terminal_ids: Vec<String>,
         layout: Option<Value>,

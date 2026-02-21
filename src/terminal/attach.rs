@@ -53,9 +53,17 @@ pub async fn attach_view(
     stdout.execute(cursor::Hide)?;
 
     let result = run_tui(TuiInit {
-        stream, terminal_name, cols, rows, config,
-        extra_terminals, view_id, saved_layout, saved_focused,
-    }).await;
+        stream,
+        terminal_name,
+        cols,
+        rows,
+        config,
+        extra_terminals,
+        view_id,
+        saved_layout,
+        saved_focused,
+    })
+    .await;
 
     let mut stdout = io::stdout();
     let _ = stdout.execute(cursor::Show);
@@ -115,7 +123,10 @@ impl TuiSession {
         }
         let bar = self.screen.status_bar_area();
         self.renderer.render_status_bar(
-            &self.input.mode().status_text(&self.label, &self.config.prefix),
+            &self
+                .input
+                .mode()
+                .status_text(&self.label, &self.config.prefix),
             &bar,
         )?;
         self.renderer.flush()?;
@@ -171,7 +182,8 @@ impl TuiSession {
     }
 
     async fn handle_split(&mut self, direction: SplitDirection) -> Result<()> {
-        let focused_rect = self.layout
+        let focused_rect = self
+            .layout
             .compute_rects(self.screen.pane_area())
             .into_iter()
             .find(|(id, _)| id == self.layout.focused_terminal())
@@ -194,7 +206,9 @@ impl TuiSession {
 
         let mut client = IpcClient::connect().await?;
         if !matches!(
-            client.send(Request::TerminalAttach { id: new_id.clone() }).await?,
+            client
+                .send(Request::TerminalAttach { id: new_id.clone() })
+                .await?,
             Response::Ok
         ) {
             if let Ok(mut c) = IpcClient::connect().await {
@@ -203,7 +217,8 @@ impl TuiSession {
             return Ok(());
         }
 
-        self.spawn_terminal(new_id.clone(), client.into_stream()).await?;
+        self.spawn_terminal(new_id.clone(), client.into_stream())
+            .await?;
         self.layout.split(direction, new_id.clone());
         self.resize_all_vterms().await?;
         self.render_all()?;
@@ -211,10 +226,12 @@ impl TuiSession {
         if let Some(vid) = &self.view_id {
             let vid = vid.clone();
             if let Ok(mut c) = IpcClient::connect().await {
-                let _ = c.send(Request::ViewAddTerminal {
-                    view_id: vid.clone(),
-                    terminal_id: new_id,
-                }).await;
+                let _ = c
+                    .send(Request::ViewAddTerminal {
+                        view_id: vid.clone(),
+                        terminal_id: new_id,
+                    })
+                    .await;
             }
             self.sync_layout().await;
         }
@@ -236,10 +253,12 @@ impl TuiSession {
             if let Some(vid) = &self.view_id {
                 let vid = vid.clone();
                 if let Ok(mut c) = IpcClient::connect().await {
-                    let _ = c.send(Request::ViewRemoveTerminal {
-                        view_id: vid.clone(),
-                        terminal_id: closed,
-                    }).await;
+                    let _ = c
+                        .send(Request::ViewRemoveTerminal {
+                            view_id: vid.clone(),
+                            terminal_id: closed,
+                        })
+                        .await;
                 }
                 self.sync_layout().await;
             }
@@ -285,7 +304,9 @@ impl TuiSession {
             if !self.writers.contains_key(tid) {
                 let mut client = IpcClient::connect().await?;
                 if !matches!(
-                    client.send(Request::TerminalAttach { id: tid.clone() }).await?,
+                    client
+                        .send(Request::TerminalAttach { id: tid.clone() })
+                        .await?,
                     Response::Ok
                 ) {
                     continue;
@@ -312,7 +333,9 @@ impl TuiSession {
                     tid.clone(),
                     tokio::spawn(async move {
                         let mut sock_read = sock_read;
-                        while let Ok((_, BinaryFrame::Data(data))) = read_binary_frame(&mut sock_read).await {
+                        while let Ok((_, BinaryFrame::Data(data))) =
+                            read_binary_frame(&mut sock_read).await
+                        {
                             if tx_clone.send((tid_clone.clone(), data)).await.is_err() {
                                 break;
                             }
@@ -321,7 +344,11 @@ impl TuiSession {
                 );
             }
             if tid != first
-                && !self.layout.compute_rects(pane_area).iter().any(|(id, _)| id == tid)
+                && !self
+                    .layout
+                    .compute_rects(pane_area)
+                    .iter()
+                    .any(|(id, _)| id == tid)
             {
                 self.layout.split(SplitDirection::Vertical, tid.clone());
             }
@@ -341,7 +368,12 @@ impl TuiSession {
         self.vterms.insert(id.clone(), VirtualTerminal::new(h, w));
 
         let (sock_read, mut sock_write) = stream.into_split();
-        write_binary_frame(&mut sock_write, &id, &BinaryFrame::Resize { cols: w, rows: h }).await?;
+        write_binary_frame(
+            &mut sock_write,
+            &id,
+            &BinaryFrame::Resize { cols: w, rows: h },
+        )
+        .await?;
         self.writers.insert(id.clone(), sock_write);
 
         let tx_clone = self.tx.clone();
@@ -350,7 +382,8 @@ impl TuiSession {
             id,
             tokio::spawn(async move {
                 let mut sock_read = sock_read;
-                while let Ok((_, BinaryFrame::Data(data))) = read_binary_frame(&mut sock_read).await {
+                while let Ok((_, BinaryFrame::Data(data))) = read_binary_frame(&mut sock_read).await
+                {
                     if tx_clone.send((tid.clone(), data)).await.is_err() {
                         break;
                     }
@@ -396,7 +429,9 @@ struct TuiInit<'a> {
 async fn run_tui(init: TuiInit<'_>) -> Result<()> {
     let has_saved_layout = matches!(&init.saved_layout, Some(v) if !v.is_null());
     let layout = match init.saved_layout {
-        Some(v) if !v.is_null() => PaneLayout::from_value(v, init.saved_focused.as_deref(), init.terminal_name),
+        Some(v) if !v.is_null() => {
+            PaneLayout::from_value(v, init.saved_focused.as_deref(), init.terminal_name)
+        }
         _ => PaneLayout::new(init.terminal_name.to_string()),
     };
 
@@ -424,7 +459,9 @@ async fn run_tui(init: TuiInit<'_>) -> Result<()> {
 
     // Spawn reader for initial terminal
     let (sock_read, sock_write) = init.stream.into_split();
-    session.writers.insert(init.terminal_name.to_string(), sock_write);
+    session
+        .writers
+        .insert(init.terminal_name.to_string(), sock_write);
     let tx_clone = tx.clone();
     let initial_id = init.terminal_name.to_string();
     session.read_tasks.insert(
@@ -444,7 +481,9 @@ async fn run_tui(init: TuiInit<'_>) -> Result<()> {
     for tid in init.extra_terminals {
         let mut client = IpcClient::connect().await?;
         if !matches!(
-            client.send(Request::TerminalAttach { id: tid.clone() }).await?,
+            client
+                .send(Request::TerminalAttach { id: tid.clone() })
+                .await?,
             Response::Ok
         ) {
             continue;

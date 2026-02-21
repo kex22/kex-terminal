@@ -48,7 +48,10 @@ pub async fn write_binary_frame(
     let mut header = [0u8; 13];
     header[0] = type_byte;
     let tid_bytes = terminal_id.as_bytes();
-    debug_assert!(tid_bytes.len() <= 8, "terminal_id exceeds 8-byte frame field: {terminal_id}");
+    debug_assert!(
+        tid_bytes.len() <= 8,
+        "terminal_id exceeds 8-byte frame field: {terminal_id}"
+    );
     let copy_len = tid_bytes.len().min(8);
     header[1..1 + copy_len].copy_from_slice(&tid_bytes[..copy_len]);
 
@@ -88,7 +91,9 @@ pub async fn read_binary_frame(
     let payload_len = u32::from_be_bytes([header[9], header[10], header[11], header[12]]) as usize;
 
     if payload_len > MAX_MESSAGE_SIZE {
-        return Err(KexError::Ipc(format!("frame too large: {payload_len} bytes")));
+        return Err(KexError::Ipc(format!(
+            "frame too large: {payload_len} bytes"
+        )));
     }
 
     let frame = match type_byte {
@@ -99,7 +104,9 @@ pub async fn read_binary_frame(
         }
         FRAME_TYPE_RESIZE => {
             if payload_len != 4 {
-                return Err(KexError::Ipc(format!("resize frame expects 4 bytes, got {payload_len}")));
+                return Err(KexError::Ipc(format!(
+                    "resize frame expects 4 bytes, got {payload_len}"
+                )));
             }
             let mut buf = [0u8; 4];
             stream.read_exact(&mut buf).await?;
@@ -162,7 +169,9 @@ mod tests {
         };
         write_message(&mut client, &req).await.unwrap();
         let decoded: Request = read_message(&mut server).await.unwrap();
-        assert!(matches!(decoded, Request::ViewUpdateLayout { view_id, focused, .. } if view_id == "v1" && focused == "t1"));
+        assert!(
+            matches!(decoded, Request::ViewUpdateLayout { view_id, focused, .. } if view_id == "v1" && focused == "t1")
+        );
     }
 
     #[tokio::test]
@@ -174,7 +183,9 @@ mod tests {
         };
         write_message(&mut client, &req).await.unwrap();
         let decoded: Request = read_message(&mut server).await.unwrap();
-        assert!(matches!(decoded, Request::ViewRemoveTerminal { view_id, terminal_id } if view_id == "v1" && terminal_id == "t1"));
+        assert!(
+            matches!(decoded, Request::ViewRemoveTerminal { view_id, terminal_id } if view_id == "v1" && terminal_id == "t1")
+        );
     }
 
     #[tokio::test]
@@ -187,14 +198,18 @@ mod tests {
         };
         write_message(&mut server, &resp).await.unwrap();
         let decoded: Response = read_message(&mut client).await.unwrap();
-        assert!(matches!(decoded, Response::ViewAttach { terminal_ids, layout: Some(_), focused: Some(f) } if terminal_ids.len() == 2 && f == "t2"));
+        assert!(
+            matches!(decoded, Response::ViewAttach { terminal_ids, layout: Some(_), focused: Some(f) } if terminal_ids.len() == 2 && f == "t2")
+        );
     }
 
     #[tokio::test]
     async fn binary_frame_roundtrip_data() {
         let (mut client, mut server) = paired_streams().await;
         let frame = BinaryFrame::Data(vec![1, 2, 3, 4]);
-        write_binary_frame(&mut client, "abcd1234", &frame).await.unwrap();
+        write_binary_frame(&mut client, "abcd1234", &frame)
+            .await
+            .unwrap();
         let (tid, decoded) = read_binary_frame(&mut server).await.unwrap();
         assert_eq!(tid, "abcd1234");
         assert_eq!(decoded, BinaryFrame::Data(vec![1, 2, 3, 4]));
@@ -203,17 +218,30 @@ mod tests {
     #[tokio::test]
     async fn binary_frame_roundtrip_resize() {
         let (mut client, mut server) = paired_streams().await;
-        let frame = BinaryFrame::Resize { cols: 120, rows: 40 };
-        write_binary_frame(&mut client, "term0001", &frame).await.unwrap();
+        let frame = BinaryFrame::Resize {
+            cols: 120,
+            rows: 40,
+        };
+        write_binary_frame(&mut client, "term0001", &frame)
+            .await
+            .unwrap();
         let (tid, decoded) = read_binary_frame(&mut server).await.unwrap();
         assert_eq!(tid, "term0001");
-        assert_eq!(decoded, BinaryFrame::Resize { cols: 120, rows: 40 });
+        assert_eq!(
+            decoded,
+            BinaryFrame::Resize {
+                cols: 120,
+                rows: 40
+            }
+        );
     }
 
     #[tokio::test]
     async fn binary_frame_roundtrip_detach() {
         let (mut client, mut server) = paired_streams().await;
-        write_binary_frame(&mut client, "t1234567", &BinaryFrame::Detach).await.unwrap();
+        write_binary_frame(&mut client, "t1234567", &BinaryFrame::Detach)
+            .await
+            .unwrap();
         let (tid, decoded) = read_binary_frame(&mut server).await.unwrap();
         assert_eq!(tid, "t1234567");
         assert_eq!(decoded, BinaryFrame::Detach);
@@ -223,7 +251,9 @@ mod tests {
     async fn binary_frame_empty_data() {
         let (mut client, mut server) = paired_streams().await;
         let frame = BinaryFrame::Data(vec![]);
-        write_binary_frame(&mut client, "abcd1234", &frame).await.unwrap();
+        write_binary_frame(&mut client, "abcd1234", &frame)
+            .await
+            .unwrap();
         let (_, decoded) = read_binary_frame(&mut server).await.unwrap();
         assert_eq!(decoded, BinaryFrame::Data(vec![]));
     }
