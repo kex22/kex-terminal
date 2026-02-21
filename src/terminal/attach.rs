@@ -7,6 +7,8 @@ use crossterm::{ExecutableCommand, cursor};
 use futures_lite::StreamExt;
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::error::Result;
@@ -49,7 +51,10 @@ pub async fn attach_view(
     terminal::enable_raw_mode()?;
     stdout.execute(cursor::Hide)?;
 
-    let result = run_tui(stream, terminal_name, cols, rows, &config, extra_terminals, view_id, saved_layout, saved_focused).await;
+    let result = run_tui(TuiInit {
+        stream, terminal_name, cols, rows, config,
+        extra_terminals, view_id, saved_layout, saved_focused,
+    }).await;
 
     let mut stdout = io::stdout();
     let _ = stdout.execute(cursor::Show);
@@ -59,37 +64,368 @@ pub async fn attach_view(
     result
 }
 
-async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16, config: &Config, extra_terminals: &[String], view_id: Option<&str>, saved_layout: Option<serde_json::Value>, saved_focused: Option<String>) -> Result<()> {
-    let mut screen = Screen::new(rows, cols);
-    let mut renderer = Renderer::new(io::stdout());
-    let mut input = InputHandler::with_prefix(config.prefix.clone());
+struct TuiSession {
+    layout: PaneLayout,
+    vterms: HashMap<String, VirtualTerminal>,
+    writers: HashMap<String, OwnedWriteHalf>,
+    read_tasks: HashMap<String, JoinHandle<()>>,
+    screen: Screen,
+    renderer: Renderer<io::Stdout>,
+    input: InputHandler,
+    config: Config,
+    tx: mpsc::Sender<(String, Vec<u8>)>,
+    view_id: Option<String>,
+    label: String,
+}
 
-    // Multi-pane state
-    let has_saved_layout = matches!(&saved_layout, Some(v) if !v.is_null());
-    let mut layout = match saved_layout {
-        Some(v) if !v.is_null() => PaneLayout::from_value(v, saved_focused.as_deref(), terminal_name),
-        _ => PaneLayout::new(terminal_name.to_string()),
+impl TuiSession {
+    fn render_all(&mut self) -> Result<()> {
+        let pane_area = self.screen.pane_area();
+        let rects = self.layout.compute_rects(pane_area);
+        for (tid, rect) in &rects {
+            if let Some(vterm) = self.vterms.get_mut(tid) {
+                self.renderer.render_vterm(vterm, rect)?;
+                vterm.take_dirty_rows();
+            }
+        }
+        for (is_vert, x, y, len) in self.layout.compute_separators(pane_area) {
+            if is_vert {
+                self.renderer.render_vsep(x, y, len)?;
+            } else {
+                self.renderer.render_hsep(x, y, len)?;
+            }
+        }
+        self.render_status()?;
+        let focused = self.layout.focused_terminal();
+        if let Some(vterm) = self.vterms.get(focused)
+            && let Some((_, rect)) = rects.iter().find(|(id, _)| id == focused)
+        {
+            let (cr, cc) = vterm.cursor_position();
+            io::stdout().execute(cursor::MoveTo(rect.x + cc, rect.y + cr))?;
+            io::stdout().execute(cursor::Show)?;
+        }
+        self.renderer.flush()?;
+        Ok(())
+    }
+
+    fn render_status(&mut self) -> Result<()> {
+        if !self.config.status_bar {
+            return Ok(());
+        }
+        let bar = self.screen.status_bar_area();
+        self.renderer.render_status_bar(
+            &self.input.mode().status_text(&self.label, &self.config.prefix),
+            &bar,
+        )?;
+        self.renderer.flush()?;
+        Ok(())
+    }
+
+    fn handle_pty_data(&mut self, tid: &str, data: &[u8]) -> Result<()> {
+        let Some(vterm) = self.vterms.get_mut(tid) else {
+            return Ok(());
+        };
+        vterm.process(data);
+        let rects = self.layout.compute_rects(self.screen.pane_area());
+        let Some((_, rect)) = rects.iter().find(|(id, _)| id == tid) else {
+            return Ok(());
+        };
+        let dirty = vterm.take_dirty_rows();
+        if !dirty.is_empty() {
+            self.renderer.render_vterm_rows(vterm, rect, &dirty)?;
+        }
+        if tid == self.layout.focused_terminal() {
+            let (cr, cc) = vterm.cursor_position();
+            io::stdout().execute(cursor::MoveTo(rect.x + cc, rect.y + cr))?;
+            io::stdout().execute(cursor::Show)?;
+        }
+        self.renderer.flush()?;
+        Ok(())
+    }
+
+    async fn resize_all_vterms(&mut self) -> Result<()> {
+        for (tid, rect) in self.layout.compute_rects(self.screen.pane_area()) {
+            if let Some(vterm) = self.vterms.get_mut(&tid) {
+                vterm.resize(rect.height, rect.width);
+            }
+            if let Some(w) = self.writers.get_mut(&tid) {
+                let _ = write_message(
+                    w,
+                    &StreamMessage::Resize {
+                        cols: rect.width,
+                        rows: rect.height,
+                    },
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_resize(&mut self, new_rows: u16, new_cols: u16) -> Result<()> {
+        self.screen.resize(new_rows, new_cols);
+        self.resize_all_vterms().await?;
+        self.render_all()
+    }
+
+    async fn handle_split(&mut self, direction: SplitDirection) -> Result<()> {
+        let focused_rect = self.layout
+            .compute_rects(self.screen.pane_area())
+            .into_iter()
+            .find(|(id, _)| id == self.layout.focused_terminal())
+            .map(|(_, r)| r);
+        if let Some(r) = focused_rect {
+            let too_small = match direction {
+                SplitDirection::Vertical => r.width < 4,
+                SplitDirection::Horizontal => r.height < 4,
+            };
+            if too_small {
+                return Ok(());
+            }
+        }
+
+        let mut client = IpcClient::connect().await?;
+        let new_id = match client.send(Request::TerminalCreate { name: None }).await? {
+            Response::TerminalCreated { id } => id,
+            _ => return Ok(()),
+        };
+
+        let mut client = IpcClient::connect().await?;
+        if !matches!(
+            client.send(Request::TerminalAttach { id: new_id.clone() }).await?,
+            Response::Ok
+        ) {
+            if let Ok(mut c) = IpcClient::connect().await {
+                let _ = c.send(Request::TerminalKill { id: new_id }).await;
+            }
+            return Ok(());
+        }
+
+        self.spawn_terminal(new_id.clone(), client.into_stream()).await?;
+        self.layout.split(direction, new_id.clone());
+        self.resize_all_vterms().await?;
+        self.render_all()?;
+
+        if let Some(vid) = &self.view_id {
+            let vid = vid.clone();
+            if let Ok(mut c) = IpcClient::connect().await {
+                let _ = c.send(Request::ViewAddTerminal {
+                    view_id: vid.clone(),
+                    terminal_id: new_id,
+                }).await;
+            }
+            self.sync_layout().await;
+        }
+        Ok(())
+    }
+
+    async fn handle_close(&mut self) -> Result<()> {
+        if let Some(closed) = self.layout.close_focused() {
+            self.vterms.remove(&closed);
+            if let Some(task) = self.read_tasks.remove(&closed) {
+                task.abort();
+            }
+            if let Some(mut w) = self.writers.remove(&closed) {
+                let _ = write_message(&mut w, &StreamMessage::Detach).await;
+            }
+            self.resize_all_vterms().await?;
+            self.render_all()?;
+
+            if let Some(vid) = &self.view_id {
+                let vid = vid.clone();
+                if let Ok(mut c) = IpcClient::connect().await {
+                    let _ = c.send(Request::ViewRemoveTerminal {
+                        view_id: vid.clone(),
+                        terminal_id: closed,
+                    }).await;
+                }
+                self.sync_layout().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_pane_resize(&mut self, dir: crate::tui::input::Direction) -> Result<()> {
+        self.layout.resize_focused(dir, 0.05);
+        self.resize_all_vterms().await?;
+        self.render_all()?;
+        if self.view_id.is_some() {
+            self.sync_layout().await;
+        }
+        Ok(())
+    }
+
+    async fn switch_view(&mut self, terminal_ids: &[String]) -> Result<()> {
+        if terminal_ids.is_empty() {
+            return Ok(());
+        }
+
+        let new_set: std::collections::HashSet<&String> = terminal_ids.iter().collect();
+        let old_ids: Vec<String> = self.writers.keys().cloned().collect();
+
+        for id in &old_ids {
+            if !new_set.contains(id) {
+                if let Some(task) = self.read_tasks.remove(id) {
+                    task.abort();
+                }
+                if let Some(mut w) = self.writers.remove(id) {
+                    let _ = write_message(&mut w, &StreamMessage::Detach).await;
+                }
+                self.vterms.remove(id);
+            }
+        }
+
+        let first = &terminal_ids[0];
+        self.layout = PaneLayout::new(first.clone());
+
+        let pane_area = self.screen.pane_area();
+        for tid in terminal_ids {
+            if !self.writers.contains_key(tid) {
+                let mut client = IpcClient::connect().await?;
+                if !matches!(
+                    client.send(Request::TerminalAttach { id: tid.clone() }).await?,
+                    Response::Ok
+                ) {
+                    continue;
+                }
+                let stream = client.into_stream();
+                let (sock_read, mut sock_write) = stream.into_split();
+                let _ = write_message(
+                    &mut sock_write,
+                    &StreamMessage::Resize {
+                        cols: pane_area.width,
+                        rows: pane_area.height,
+                    },
+                )
+                .await;
+                self.writers.insert(tid.clone(), sock_write);
+                self.vterms.insert(
+                    tid.clone(),
+                    VirtualTerminal::new(pane_area.height, pane_area.width),
+                );
+                let tx_clone = self.tx.clone();
+                let tid_clone = tid.clone();
+                self.read_tasks.insert(
+                    tid.clone(),
+                    tokio::spawn(async move {
+                        let mut sock_read = sock_read;
+                        while let Ok(StreamMessage::Data(data)) = read_message(&mut sock_read).await {
+                            if tx_clone.send((tid_clone.clone(), data)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }),
+                );
+            }
+            if tid != first
+                && !self.layout.compute_rects(pane_area).iter().any(|(id, _)| id == tid)
+            {
+                self.layout.split(SplitDirection::Vertical, tid.clone());
+            }
+        }
+
+        self.resize_all_vterms().await?;
+        self.render_all()
+    }
+
+    async fn spawn_terminal(&mut self, id: String, stream: UnixStream) -> Result<()> {
+        let rects = self.layout.compute_rects(self.screen.pane_area());
+        let (h, w) = rects
+            .iter()
+            .find(|(tid, _)| tid == &id)
+            .map(|(_, r)| (r.height, r.width))
+            .unwrap_or((24, 80));
+        self.vterms.insert(id.clone(), VirtualTerminal::new(h, w));
+
+        let (sock_read, mut sock_write) = stream.into_split();
+        write_message(&mut sock_write, &StreamMessage::Resize { cols: w, rows: h }).await?;
+        self.writers.insert(id.clone(), sock_write);
+
+        let tx_clone = self.tx.clone();
+        let tid = id.clone();
+        self.read_tasks.insert(
+            id,
+            tokio::spawn(async move {
+                let mut sock_read = sock_read;
+                while let Ok(StreamMessage::Data(data)) = read_message(&mut sock_read).await {
+                    if tx_clone.send((tid.clone(), data)).await.is_err() {
+                        break;
+                    }
+                }
+            }),
+        );
+        Ok(())
+    }
+
+    async fn sync_layout(&self) {
+        if let Some(vid) = &self.view_id
+            && let Ok(mut c) = IpcClient::connect().await
+        {
+            let _ = c
+                .send(Request::ViewUpdateLayout {
+                    view_id: vid.clone(),
+                    layout: self.layout.to_value(),
+                    focused: self.layout.focused_terminal().to_string(),
+                })
+                .await;
+        }
+    }
+
+    async fn detach_all(&mut self) {
+        for (_, mut w) in self.writers.drain() {
+            let _ = write_message(&mut w, &StreamMessage::Detach).await;
+        }
+    }
+}
+
+struct TuiInit<'a> {
+    stream: UnixStream,
+    terminal_name: &'a str,
+    cols: u16,
+    rows: u16,
+    config: Config,
+    extra_terminals: &'a [String],
+    view_id: Option<&'a str>,
+    saved_layout: Option<serde_json::Value>,
+    saved_focused: Option<String>,
+}
+
+async fn run_tui(init: TuiInit<'_>) -> Result<()> {
+    let has_saved_layout = matches!(&init.saved_layout, Some(v) if !v.is_null());
+    let layout = match init.saved_layout {
+        Some(v) if !v.is_null() => PaneLayout::from_value(v, init.saved_focused.as_deref(), init.terminal_name),
+        _ => PaneLayout::new(init.terminal_name.to_string()),
     };
-    let mut vterms: HashMap<String, VirtualTerminal> = HashMap::new();
-    let mut writers: HashMap<String, OwnedWriteHalf> = HashMap::new();
 
-    // Initial pane setup
-    let pane_area = screen.pane_area();
-    vterms.insert(
-        terminal_name.to_string(),
+    let (tx, mut rx) = mpsc::channel::<(String, Vec<u8>)>(64);
+
+    let pane_area = Screen::new(init.rows, init.cols).pane_area();
+    let mut session = TuiSession {
+        layout,
+        vterms: HashMap::new(),
+        writers: HashMap::new(),
+        read_tasks: HashMap::new(),
+        screen: Screen::new(init.rows, init.cols),
+        renderer: Renderer::new(io::stdout()),
+        input: InputHandler::with_prefix(init.config.prefix.clone()),
+        config: init.config,
+        tx: tx.clone(),
+        view_id: init.view_id.map(String::from),
+        label: init.terminal_name.to_string(),
+    };
+
+    session.vterms.insert(
+        init.terminal_name.to_string(),
         VirtualTerminal::new(pane_area.height, pane_area.width),
     );
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(64);
-    let mut read_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
-
     // Spawn reader for initial terminal
-    let (sock_read, sock_write) = stream.into_split();
-    writers.insert(terminal_name.to_string(), sock_write);
+    let (sock_read, sock_write) = init.stream.into_split();
+    session.writers.insert(init.terminal_name.to_string(), sock_write);
     let tx_clone = tx.clone();
-    let initial_id = terminal_name.to_string();
-    read_tasks.insert(
-        terminal_name.to_string(),
+    let initial_id = init.terminal_name.to_string();
+    session.read_tasks.insert(
+        init.terminal_name.to_string(),
         tokio::spawn(async move {
             let mut sock_read = sock_read;
             while let Ok(StreamMessage::Data(data)) = read_message(&mut sock_read).await {
@@ -99,11 +435,10 @@ async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16, 
             }
         }),
     );
-    let split_tx = tx.clone();
     drop(tx);
 
     // Connect extra terminals for view restore
-    for tid in extra_terminals {
+    for tid in init.extra_terminals {
         let mut client = IpcClient::connect().await?;
         if !matches!(
             client.send(Request::TerminalAttach { id: tid.clone() }).await?,
@@ -113,132 +448,63 @@ async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16, 
         }
         let stream = client.into_stream();
         if !has_saved_layout {
-            layout.split(SplitDirection::Vertical, tid.clone());
+            session.layout.split(SplitDirection::Vertical, tid.clone());
         }
-        let rects = layout.compute_rects(screen.pane_area());
-        let (h, w) = rects
-            .iter()
-            .find(|(id, _)| id == tid)
-            .map(|(_, r)| (r.height, r.width))
-            .unwrap_or((24, 80));
-        vterms.insert(tid.clone(), VirtualTerminal::new(h, w));
-        let (sock_read, mut sock_write) = stream.into_split();
-        let _ = write_message(&mut sock_write, &StreamMessage::Resize { cols: w, rows: h }).await;
-        writers.insert(tid.clone(), sock_write);
-        let tx_clone = split_tx.clone();
-        let tid_clone = tid.clone();
-        read_tasks.insert(
-            tid.clone(),
-            tokio::spawn(async move {
-                let mut sock_read = sock_read;
-                while let Ok(StreamMessage::Data(data)) = read_message(&mut sock_read).await {
-                    if tx_clone.send((tid_clone.clone(), data)).await.is_err() {
-                        break;
-                    }
-                }
-            }),
-        );
+        session.spawn_terminal(tid.clone(), stream).await?;
     }
 
-    render_all_panes(
-        &mut renderer,
-        &layout,
-        &mut vterms,
-        &screen,
-        &input,
-        terminal_name,
-        config,
-    )?;
+    session.render_all()?;
 
     let mut event_reader = EventStream::new();
 
     loop {
         tokio::select! {
             Some((tid, data)) = rx.recv() => {
-                handle_pty_data(&tid, &data, &layout, &mut vterms, &mut renderer, &screen)?;
+                session.handle_pty_data(&tid, &data)?;
             }
             Some(Ok(event)) = event_reader.next() => {
                 if let Event::Resize(new_cols, new_rows) = event {
-                    handle_resize(
-                        new_rows, new_cols, &mut screen, &layout,
-                        &mut vterms, &mut writers, &mut renderer, &input, terminal_name, config,
-                    ).await?;
+                    session.handle_resize(new_rows, new_cols).await?;
                     continue;
                 }
-                match input.handle_event(&event) {
+                match session.input.handle_event(&event) {
                     Action::SendToTerminal(bytes) => {
-                        let focused = layout.focused_terminal().to_string();
-                        if let Some(w) = writers.get_mut(&focused)
+                        let focused = session.layout.focused_terminal().to_string();
+                        if let Some(w) = session.writers.get_mut(&focused)
                             && write_message(w, &StreamMessage::Data(bytes)).await.is_err()
                         {
                             break;
                         }
                     }
                     Action::ModeChanged(_) => {
-                        render_status(&mut renderer, &screen, &input, terminal_name, config)?;
+                        session.render_status()?;
                     }
                     Action::PaneSplitHorizontal => {
-                        handle_split(
-                            SplitDirection::Horizontal, &mut layout, &mut vterms,
-                            &mut writers, &mut read_tasks, &split_tx, &screen,
-                            &mut renderer, &input, terminal_name, config, view_id,
-                        ).await?;
+                        session.handle_split(SplitDirection::Horizontal).await?;
                     }
                     Action::PaneSplitVertical => {
-                        handle_split(
-                            SplitDirection::Vertical, &mut layout, &mut vterms,
-                            &mut writers, &mut read_tasks, &split_tx, &screen,
-                            &mut renderer, &input, terminal_name, config, view_id,
-                        ).await?;
+                        session.handle_split(SplitDirection::Vertical).await?;
                     }
                     Action::PaneNavigate(dir) => {
-                        layout.navigate(dir, screen.pane_area());
-                        render_all_panes(&mut renderer, &layout, &mut vterms, &screen, &input, terminal_name, config)?;
+                        session.layout.navigate(dir, session.screen.pane_area());
+                        session.render_all()?;
                     }
                     Action::PaneResize(dir) => {
-                        layout.resize_focused(dir, 0.05);
-                        resize_all_vterms(&layout, &mut vterms, &mut writers, &screen).await?;
-                        render_all_panes(&mut renderer, &layout, &mut vterms, &screen, &input, terminal_name, config)?;
-                        if let Some(vid) = view_id {
-                            sync_layout(vid, &layout).await;
-                        }
+                        session.handle_pane_resize(dir).await?;
                     }
                     Action::PaneClose => {
-                        if let Some(closed) = layout.close_focused() {
-                            vterms.remove(&closed);
-                            if let Some(task) = read_tasks.remove(&closed) {
-                                task.abort();
-                            }
-                            if let Some(mut w) = writers.remove(&closed) {
-                                let _ = write_message(&mut w, &StreamMessage::Detach).await;
-                            }
-                            resize_all_vterms(&layout, &mut vterms, &mut writers, &screen).await?;
-                            render_all_panes(&mut renderer, &layout, &mut vterms, &screen, &input, terminal_name, config)?;
-                            if let Some(vid) = view_id {
-                                if let Ok(mut c) = IpcClient::connect().await {
-                                    let _ = c.send(Request::ViewRemoveTerminal {
-                                        view_id: vid.to_string(),
-                                        terminal_id: closed,
-                                    }).await;
-                                }
-                                sync_layout(vid, &layout).await;
-                            }
-                        }
+                        session.handle_close().await?;
                     }
                     Action::ViewList => {
                         if let Ok(text) = fetch_view_list_text().await {
-                            let bar = screen.status_bar_area();
-                            renderer.render_status_bar(&text, &bar)?;
-                            renderer.flush()?;
+                            let bar = session.screen.status_bar_area();
+                            session.renderer.render_status_bar(&text, &bar)?;
+                            session.renderer.flush()?;
                         }
                     }
                     Action::ViewSwitch(n) => {
                         if let Ok(info) = fetch_view_by_index(n).await {
-                            switch_view(
-                                &info.terminal_ids, &mut layout, &mut vterms,
-                                &mut writers, &mut read_tasks, &split_tx, &screen,
-                                &mut renderer, &input, terminal_name, config,
-                            ).await?;
+                            session.switch_view(&info.terminal_ids).await?;
                         }
                     }
                     Action::Detach => break,
@@ -249,246 +515,8 @@ async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16, 
         }
     }
 
-    // Detach all terminals
-    for (_, mut w) in writers.drain() {
-        let _ = write_message(&mut w, &StreamMessage::Detach).await;
-    }
-
+    session.detach_all().await;
     Ok(())
-}
-
-fn handle_pty_data(
-    tid: &str,
-    data: &[u8],
-    layout: &PaneLayout,
-    vterms: &mut HashMap<String, VirtualTerminal>,
-    renderer: &mut Renderer<io::Stdout>,
-    screen: &Screen,
-) -> Result<()> {
-    let Some(vterm) = vterms.get_mut(tid) else {
-        return Ok(());
-    };
-    vterm.process(data);
-    let rects = layout.compute_rects(screen.pane_area());
-    let Some((_, rect)) = rects.iter().find(|(id, _)| id == tid) else {
-        return Ok(());
-    };
-    let dirty = vterm.take_dirty_rows();
-    if !dirty.is_empty() {
-        renderer.render_vterm_rows(vterm, rect, &dirty)?;
-    }
-    // Show cursor in focused pane
-    if tid == layout.focused_terminal() {
-        let (cr, cc) = vterm.cursor_position();
-        io::stdout().execute(cursor::MoveTo(rect.x + cc, rect.y + cr))?;
-        io::stdout().execute(cursor::Show)?;
-    }
-    renderer.flush()?;
-    Ok(())
-}
-
-fn render_all_panes(
-    renderer: &mut Renderer<io::Stdout>,
-    layout: &PaneLayout,
-    vterms: &mut HashMap<String, VirtualTerminal>,
-    screen: &Screen,
-    input: &InputHandler,
-    terminal_name: &str,
-    config: &Config,
-) -> Result<()> {
-    let pane_area = screen.pane_area();
-    let rects = layout.compute_rects(pane_area);
-    for (tid, rect) in &rects {
-        if let Some(vterm) = vterms.get_mut(tid) {
-            renderer.render_vterm(vterm, rect)?;
-            vterm.take_dirty_rows();
-        }
-    }
-    for (is_vert, x, y, len) in layout.compute_separators(pane_area) {
-        if is_vert {
-            renderer.render_vsep(x, y, len)?;
-        } else {
-            renderer.render_hsep(x, y, len)?;
-        }
-    }
-    render_status(renderer, screen, input, terminal_name, config)?;
-    let focused = layout.focused_terminal();
-    if let Some(vterm) = vterms.get(focused)
-        && let Some((_, rect)) = rects.iter().find(|(id, _)| id == focused)
-    {
-        let (cr, cc) = vterm.cursor_position();
-        io::stdout().execute(cursor::MoveTo(rect.x + cc, rect.y + cr))?;
-        io::stdout().execute(cursor::Show)?;
-    }
-    renderer.flush()?;
-    Ok(())
-}
-
-fn render_status(
-    renderer: &mut Renderer<io::Stdout>,
-    screen: &Screen,
-    input: &InputHandler,
-    terminal_name: &str,
-    config: &Config,
-) -> Result<()> {
-    if !config.status_bar {
-        return Ok(());
-    }
-    let bar = screen.status_bar_area();
-    renderer.render_status_bar(&input.mode().status_text(terminal_name, &config.prefix), &bar)?;
-    renderer.flush()?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_split(
-    direction: SplitDirection,
-    layout: &mut PaneLayout,
-    vterms: &mut HashMap<String, VirtualTerminal>,
-    writers: &mut HashMap<String, OwnedWriteHalf>,
-    read_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-    tx: &tokio::sync::mpsc::Sender<(String, Vec<u8>)>,
-    screen: &Screen,
-    renderer: &mut Renderer<io::Stdout>,
-    input: &InputHandler,
-    terminal_name: &str,
-    config: &Config,
-    view_id: Option<&str>,
-) -> Result<()> {
-    // Check minimum size before splitting
-    let focused_rect = layout
-        .compute_rects(screen.pane_area())
-        .into_iter()
-        .find(|(id, _)| id == layout.focused_terminal())
-        .map(|(_, r)| r);
-    if let Some(r) = focused_rect {
-        let too_small = match direction {
-            SplitDirection::Vertical => r.width < 4,
-            SplitDirection::Horizontal => r.height < 4,
-        };
-        if too_small {
-            return Ok(());
-        }
-    }
-
-    let mut client = IpcClient::connect().await?;
-    let new_id = match client.send(Request::TerminalCreate { name: None }).await? {
-        Response::TerminalCreated { id } => id,
-        _ => return Ok(()),
-    };
-
-    let mut client = IpcClient::connect().await?;
-    if !matches!(
-        client
-            .send(Request::TerminalAttach { id: new_id.clone() })
-            .await?,
-        Response::Ok
-    ) {
-        // Clean up orphaned terminal
-        if let Ok(mut c) = IpcClient::connect().await {
-            let _ = c.send(Request::TerminalKill { id: new_id }).await;
-        }
-        return Ok(());
-    }
-    let stream = client.into_stream();
-
-    layout.split(direction, new_id.clone());
-
-    let rects = layout.compute_rects(screen.pane_area());
-    let (h, w) = rects
-        .iter()
-        .find(|(id, _)| id == &new_id)
-        .map(|(_, r)| (r.height, r.width))
-        .unwrap_or((24, 80));
-    vterms.insert(new_id.clone(), VirtualTerminal::new(h, w));
-
-    let (sock_read, mut sock_write) = stream.into_split();
-    write_message(&mut sock_write, &StreamMessage::Resize { cols: w, rows: h }).await?;
-    writers.insert(new_id.clone(), sock_write);
-
-    let tx_clone = tx.clone();
-    let tid = new_id.clone();
-    read_tasks.insert(
-        new_id.clone(),
-        tokio::spawn(async move {
-            let mut sock_read = sock_read;
-            while let Ok(StreamMessage::Data(data)) = read_message(&mut sock_read).await {
-                if tx_clone.send((tid.clone(), data)).await.is_err() {
-                    break;
-                }
-            }
-        }),
-    );
-
-    resize_all_vterms(layout, vterms, writers, screen).await?;
-    render_all_panes(renderer, layout, vterms, screen, input, terminal_name, config)?;
-
-    if let Some(vid) = view_id {
-        if let Ok(mut c) = IpcClient::connect().await {
-            let _ = c.send(Request::ViewAddTerminal {
-                view_id: vid.to_string(),
-                terminal_id: new_id,
-            }).await;
-        }
-        sync_layout(vid, layout).await;
-    }
-
-    Ok(())
-}
-
-async fn resize_all_vterms(
-    layout: &PaneLayout,
-    vterms: &mut HashMap<String, VirtualTerminal>,
-    writers: &mut HashMap<String, OwnedWriteHalf>,
-    screen: &Screen,
-) -> Result<()> {
-    for (tid, rect) in layout.compute_rects(screen.pane_area()) {
-        if let Some(vterm) = vterms.get_mut(&tid) {
-            vterm.resize(rect.height, rect.width);
-        }
-        if let Some(w) = writers.get_mut(&tid) {
-            let _ = write_message(
-                w,
-                &StreamMessage::Resize {
-                    cols: rect.width,
-                    rows: rect.height,
-                },
-            )
-            .await;
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_resize(
-    new_rows: u16,
-    new_cols: u16,
-    screen: &mut Screen,
-    layout: &PaneLayout,
-    vterms: &mut HashMap<String, VirtualTerminal>,
-    writers: &mut HashMap<String, OwnedWriteHalf>,
-    renderer: &mut Renderer<io::Stdout>,
-    input: &InputHandler,
-    terminal_name: &str,
-    config: &Config,
-) -> Result<()> {
-    screen.resize(new_rows, new_cols);
-    resize_all_vterms(layout, vterms, writers, screen).await?;
-    render_all_panes(renderer, layout, vterms, screen, input, terminal_name, config)?;
-    Ok(())
-}
-
-async fn sync_layout(view_id: &str, layout: &PaneLayout) {
-    if let Ok(mut c) = IpcClient::connect().await {
-        let _ = c
-            .send(Request::ViewUpdateLayout {
-                view_id: view_id.to_string(),
-                layout: layout.to_value(),
-                focused: layout.focused_terminal().to_string(),
-            })
-            .await;
-    }
 }
 
 async fn fetch_view_list_text() -> Result<String> {
@@ -525,100 +553,4 @@ async fn fetch_view_by_index(n: usize) -> Result<ViewInfo> {
         }
         _ => Err(crate::error::KexError::Server("unexpected response".into())),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn switch_view(
-    terminal_ids: &[String],
-    layout: &mut PaneLayout,
-    vterms: &mut HashMap<String, VirtualTerminal>,
-    writers: &mut HashMap<String, OwnedWriteHalf>,
-    read_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-    tx: &tokio::sync::mpsc::Sender<(String, Vec<u8>)>,
-    screen: &Screen,
-    renderer: &mut Renderer<io::Stdout>,
-    input: &InputHandler,
-    terminal_name: &str,
-    config: &Config,
-) -> Result<()> {
-    if terminal_ids.is_empty() {
-        return Ok(());
-    }
-
-    let new_set: std::collections::HashSet<&String> = terminal_ids.iter().collect();
-    let old_ids: Vec<String> = writers.keys().cloned().collect();
-
-    // Detach terminals not in the new view
-    for id in &old_ids {
-        if !new_set.contains(id) {
-            if let Some(task) = read_tasks.remove(id) {
-                task.abort();
-            }
-            if let Some(mut w) = writers.remove(id) {
-                let _ = write_message(&mut w, &StreamMessage::Detach).await;
-            }
-            vterms.remove(id);
-        }
-    }
-
-    // Rebuild layout with first terminal
-    let first = &terminal_ids[0];
-    *layout = PaneLayout::new(first.clone());
-
-    // Attach terminals not already connected
-    let pane_area = screen.pane_area();
-    for tid in terminal_ids {
-        if !writers.contains_key(tid) {
-            let mut client = IpcClient::connect().await?;
-            if !matches!(
-                client
-                    .send(Request::TerminalAttach { id: tid.clone() })
-                    .await?,
-                Response::Ok
-            ) {
-                continue;
-            }
-            let stream = client.into_stream();
-            let (sock_read, mut sock_write) = stream.into_split();
-            let _ = write_message(
-                &mut sock_write,
-                &StreamMessage::Resize {
-                    cols: pane_area.width,
-                    rows: pane_area.height,
-                },
-            )
-            .await;
-            writers.insert(tid.clone(), sock_write);
-            vterms.insert(
-                tid.clone(),
-                VirtualTerminal::new(pane_area.height, pane_area.width),
-            );
-            let tx_clone = tx.clone();
-            let tid_clone = tid.clone();
-            read_tasks.insert(
-                tid.clone(),
-                tokio::spawn(async move {
-                    let mut sock_read = sock_read;
-                    while let Ok(StreamMessage::Data(data)) = read_message(&mut sock_read).await {
-                        if tx_clone.send((tid_clone.clone(), data)).await.is_err() {
-                            break;
-                        }
-                    }
-                }),
-            );
-        }
-        // Add additional terminals as splits
-        if tid != first
-            && !layout
-                .compute_rects(pane_area)
-                .iter()
-                .any(|(id, _)| id == tid)
-        {
-            layout.split(SplitDirection::Vertical, tid.clone());
-        }
-    }
-
-    resize_all_vterms(layout, vterms, writers, screen).await?;
-    render_all_panes(renderer, layout, vterms, screen, input, terminal_name, config)?;
-    Ok(())
 }
