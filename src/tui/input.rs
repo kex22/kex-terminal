@@ -11,7 +11,7 @@ impl Mode {
         match self {
             Mode::Normal => format!(" [NORMAL] {terminal_name} | Ctrl-a: command mode"),
             Mode::Command => {
-                " [COMMAND] h/j/k/l:nav s:split-h v:split-v n:new k:close Esc:back".into()
+                " [COMMAND] h/j/k/l:nav s:split-h v:split-v n:new x:close Esc:back".into()
             }
         }
     }
@@ -89,7 +89,8 @@ impl InputHandler {
             }
             KeyCode::Char('h') => Action::PaneNavigate(Direction::Left),
             KeyCode::Char('j') => Action::PaneNavigate(Direction::Down),
-            KeyCode::Char('k') => Action::PaneClose,
+            KeyCode::Char('k') => Action::PaneNavigate(Direction::Up),
+            KeyCode::Char('x') => Action::PaneClose,
             KeyCode::Char('l') => Action::PaneNavigate(Direction::Right),
             KeyCode::Char('s') => Action::PaneSplitHorizontal,
             KeyCode::Char('v') => Action::PaneSplitVertical,
@@ -188,6 +189,8 @@ mod tests {
         h.handle_event(&ctrl('a'));
         let action = h.handle_event(&key(KeyCode::Char('z')));
         assert_eq!(action, Action::None);
+        // Intentional: unmapped keys stay in Command mode so user can retry
+        assert_eq!(h.mode(), Mode::Command);
     }
 
     #[test]
@@ -221,9 +224,19 @@ mod tests {
             Action::PaneNavigate(Direction::Down)
         );
         assert_eq!(
+            cmd(&mut h, KeyCode::Char('k')),
+            Action::PaneNavigate(Direction::Up)
+        );
+        assert_eq!(
             cmd(&mut h, KeyCode::Char('l')),
             Action::PaneNavigate(Direction::Right)
         );
+    }
+
+    #[test]
+    fn command_close() {
+        let mut h = InputHandler::new();
+        assert_eq!(cmd(&mut h, KeyCode::Char('x')), Action::PaneClose);
     }
 
     #[test]
