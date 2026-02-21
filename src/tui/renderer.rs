@@ -81,6 +81,23 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
+    /// Draw vertical separator line at column `x` for `height` rows starting at `y`.
+    pub fn render_vsep(&mut self, x: u16, y: u16, height: u16) -> Result<()> {
+        for row in y..y + height {
+            self.writer.queue(MoveTo(x, row))?;
+            self.writer.queue(Print("│"))?;
+        }
+        Ok(())
+    }
+
+    /// Draw horizontal separator line at row `y` for `width` columns starting at `x`.
+    pub fn render_hsep(&mut self, x: u16, y: u16, width: u16) -> Result<()> {
+        self.writer.queue(MoveTo(x, y))?;
+        let line: String = "─".repeat(width as usize);
+        self.writer.queue(Print(&line))?;
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())

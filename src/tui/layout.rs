@@ -61,10 +61,12 @@ impl PaneLayout {
     }
 
     fn split_rect(area: Rect, dir: SplitDirection, ratio: f32) -> (Rect, Rect) {
+        const SEP: u16 = 1; // separator line width
         match dir {
             SplitDirection::Vertical => {
-                let w1 = (area.width as f32 * ratio) as u16;
-                let w2 = area.width.saturating_sub(w1);
+                let usable = area.width.saturating_sub(SEP);
+                let w1 = (usable as f32 * ratio) as u16;
+                let w2 = usable.saturating_sub(w1);
                 (
                     Rect {
                         x: area.x,
@@ -73,7 +75,7 @@ impl PaneLayout {
                         height: area.height,
                     },
                     Rect {
-                        x: area.x + w1,
+                        x: area.x + w1 + SEP,
                         y: area.y,
                         width: w2,
                         height: area.height,
@@ -81,8 +83,9 @@ impl PaneLayout {
                 )
             }
             SplitDirection::Horizontal => {
-                let h1 = (area.height as f32 * ratio) as u16;
-                let h2 = area.height.saturating_sub(h1);
+                let usable = area.height.saturating_sub(SEP);
+                let h1 = (usable as f32 * ratio) as u16;
+                let h2 = usable.saturating_sub(h1);
                 (
                     Rect {
                         x: area.x,
@@ -92,12 +95,41 @@ impl PaneLayout {
                     },
                     Rect {
                         x: area.x,
-                        y: area.y + h1,
+                        y: area.y + h1 + SEP,
                         width: area.width,
                         height: h2,
                     },
                 )
             }
+        }
+    }
+
+    /// Returns separator positions: (is_vertical, x, y, length).
+    pub fn compute_separators(&self, area: Rect) -> Vec<(bool, u16, u16, u16)> {
+        let mut seps = Vec::new();
+        Self::collect_seps(&self.root, area, &mut seps);
+        seps
+    }
+
+    fn collect_seps(node: &LayoutNode, area: Rect, out: &mut Vec<(bool, u16, u16, u16)>) {
+        if let LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } = node
+        {
+            let (a, b) = Self::split_rect(area, *direction, *ratio);
+            match direction {
+                SplitDirection::Vertical => {
+                    out.push((true, a.x + a.width, area.y, area.height));
+                }
+                SplitDirection::Horizontal => {
+                    out.push((false, area.x, a.y + a.height, area.width));
+                }
+            }
+            Self::collect_seps(first, a, out);
+            Self::collect_seps(second, b, out);
         }
     }
 
@@ -306,11 +338,10 @@ mod tests {
         layout.split(SplitDirection::Vertical, "t2".into());
         let rects = layout.compute_rects(area());
         assert_eq!(rects.len(), 2);
-        // First pane: left half
+        // usable = 80 - 1(sep) = 79, w1 = 39, w2 = 40
         assert_eq!(rects[0].1.x, 0);
-        assert_eq!(rects[0].1.width, 40);
-        // Second pane: right half
-        assert_eq!(rects[1].1.x, 40);
+        assert_eq!(rects[0].1.width, 39);
+        assert_eq!(rects[1].1.x, 40); // 39 + 1(sep)
         assert_eq!(rects[1].1.width, 40);
     }
 
@@ -320,9 +351,10 @@ mod tests {
         layout.split(SplitDirection::Horizontal, "t2".into());
         let rects = layout.compute_rects(area());
         assert_eq!(rects.len(), 2);
+        // usable = 24 - 1(sep) = 23, h1 = 11, h2 = 12
         assert_eq!(rects[0].1.y, 0);
-        assert_eq!(rects[0].1.height, 12);
-        assert_eq!(rects[1].1.y, 12);
+        assert_eq!(rects[0].1.height, 11);
+        assert_eq!(rects[1].1.y, 12); // 11 + 1(sep)
         assert_eq!(rects[1].1.height, 12);
     }
 
@@ -394,10 +426,9 @@ mod tests {
     fn resize_changes_ratio() {
         let mut layout = PaneLayout::new("t1".into());
         layout.split(SplitDirection::Vertical, "t2".into());
-        // t2 is second child (right), resize Right should grow t2 (shrink t1)
         layout.resize_focused(Direction::Right, 0.1);
         let rects = layout.compute_rects(area());
-        assert!(rects[0].1.width < 40, "t1 should shrink");
+        assert!(rects[0].1.width < 39, "t1 should shrink");
         assert!(rects[1].1.width > 40, "t2 should grow");
     }
 
@@ -405,12 +436,37 @@ mod tests {
     fn resize_clamps_ratio() {
         let mut layout = PaneLayout::new("t1".into());
         layout.split(SplitDirection::Vertical, "t2".into());
-        // Try to resize way beyond bounds
         for _ in 0..20 {
             layout.resize_focused(Direction::Left, 0.1);
         }
         let rects = layout.compute_rects(area());
-        // First pane should not be smaller than 10% of 80 = 8
-        assert!(rects[0].1.width >= 8);
+        // 10% of usable(79) = 7, but pane should still be reasonable
+        assert!(rects[0].1.width >= 7);
+    }
+
+    #[test]
+    fn compute_separators_vertical() {
+        let mut layout = PaneLayout::new("t1".into());
+        layout.split(SplitDirection::Vertical, "t2".into());
+        let seps = layout.compute_separators(area());
+        assert_eq!(seps.len(), 1);
+        let (is_vert, x, y, len) = seps[0];
+        assert!(is_vert);
+        assert_eq!(x, 39); // after left pane width
+        assert_eq!(y, 0);
+        assert_eq!(len, 24);
+    }
+
+    #[test]
+    fn compute_separators_horizontal() {
+        let mut layout = PaneLayout::new("t1".into());
+        layout.split(SplitDirection::Horizontal, "t2".into());
+        let seps = layout.compute_separators(area());
+        assert_eq!(seps.len(), 1);
+        let (is_vert, x, y, len) = seps[0];
+        assert!(!is_vert);
+        assert_eq!(x, 0);
+        assert_eq!(y, 11); // after top pane height
+        assert_eq!(len, 80);
     }
 }
