@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use crossterm::{cursor::MoveTo, style::Print, QueueableCommand};
+use crossterm::{QueueableCommand, cursor::MoveTo, style::Print};
 
 use super::screen::Rect;
 use super::vterm::VirtualTerminal;

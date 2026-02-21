@@ -110,7 +110,8 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                             let mut client = IpcClient::connect().await?;
                             match client.send(Request::TerminalAttach { id }).await? {
                                 Response::Ok => {
-                                    kex::terminal::attach::attach(client.into_stream(), &label).await
+                                    kex::terminal::attach::attach(client.into_stream(), &label)
+                                        .await
                                 }
                                 Response::Error { message } => Err(KexError::Server(message)),
                                 _ => Ok(()),
@@ -152,10 +153,11 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
             }
             TerminalAction::Attach { id } => {
                 let mut client = IpcClient::connect().await?;
-                match client.send(Request::TerminalAttach { id: id.clone() }).await? {
-                    Response::Ok => {
-                        kex::terminal::attach::attach(client.into_stream(), &id).await
-                    }
+                match client
+                    .send(Request::TerminalAttach { id: id.clone() })
+                    .await?
+                {
+                    Response::Ok => kex::terminal::attach::attach(client.into_stream(), &id).await,
                     Response::Error { message } => Err(KexError::Server(message)),
                     _ => Ok(()),
                 }
