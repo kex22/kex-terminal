@@ -48,6 +48,7 @@ pub async fn write_binary_frame(
     let mut header = [0u8; 13];
     header[0] = type_byte;
     let tid_bytes = terminal_id.as_bytes();
+    debug_assert!(tid_bytes.len() <= 8, "terminal_id exceeds 8-byte frame field: {terminal_id}");
     let copy_len = tid_bytes.len().min(8);
     header[1..1 + copy_len].copy_from_slice(&tid_bytes[..copy_len]);
 
@@ -97,6 +98,9 @@ pub async fn read_binary_frame(
             BinaryFrame::Data(buf)
         }
         FRAME_TYPE_RESIZE => {
+            if payload_len != 4 {
+                return Err(KexError::Ipc(format!("resize frame expects 4 bytes, got {payload_len}")));
+            }
             let mut buf = [0u8; 4];
             stream.read_exact(&mut buf).await?;
             BinaryFrame::Resize {
