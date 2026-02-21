@@ -28,6 +28,9 @@ pub enum Request {
         view_id: String,
         terminal_id: String,
     },
+    ViewAttach {
+        id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -39,6 +42,7 @@ pub enum Response {
     ViewCreated { id: String },
     ViewList { views: Vec<ViewInfo> },
     ViewShow { view: ViewInfo },
+    ViewAttach { terminal_ids: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

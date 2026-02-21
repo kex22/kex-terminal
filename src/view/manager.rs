@@ -71,6 +71,10 @@ impl ViewManager {
         views
     }
 
+    pub fn list_full(&self) -> Vec<&View> {
+        self.views.values().collect()
+    }
+
     pub fn get(&self, id_or_name: &str) -> Option<&View> {
         self.resolve_id(id_or_name)
             .and_then(|id| self.views.get(&id))

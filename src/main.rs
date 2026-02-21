@@ -24,6 +24,11 @@ enum Command {
         #[command(subcommand)]
         action: ViewAction,
     },
+    /// Manage configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -81,6 +86,11 @@ enum ViewAction {
         /// View ID or name
         id: String,
     },
+    /// Attach to a view (restore layout)
+    Attach {
+        /// View ID or name
+        id: String,
+    },
     /// Add a terminal to a view
     Add {
         /// View ID or name
@@ -88,6 +98,14 @@ enum ViewAction {
         /// Terminal ID
         terminal: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Show current configuration
+    Show,
+    /// Show configuration file path
+    Path,
 }
 
 fn main() {
@@ -258,6 +276,37 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                     _ => Ok(()),
                 }
             }
+            ViewAction::Attach { id } => {
+                let mut client = IpcClient::connect().await?;
+                match client.send(Request::ViewAttach { id: id.clone() }).await? {
+                    Response::ViewAttach { terminal_ids } => {
+                        if terminal_ids.is_empty() {
+                            return Err(KexError::Server("view has no terminals".into()));
+                        }
+                        let label = terminal_ids[0].clone();
+                        let mut client = IpcClient::connect().await?;
+                        match client
+                            .send(Request::TerminalAttach {
+                                id: terminal_ids[0].clone(),
+                            })
+                            .await?
+                        {
+                            Response::Ok => {
+                                kex::terminal::attach::attach_view(
+                                    client.into_stream(),
+                                    &label,
+                                    &terminal_ids[1..],
+                                )
+                                .await
+                            }
+                            Response::Error { message } => Err(KexError::Server(message)),
+                            _ => Ok(()),
+                        }
+                    }
+                    Response::Error { message } => Err(KexError::Server(message)),
+                    _ => Ok(()),
+                }
+            }
             ViewAction::Add { view, terminal } => {
                 let mut client = IpcClient::connect().await?;
                 match client
@@ -271,6 +320,18 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                     Response::Error { message } => Err(KexError::Server(message)),
                     _ => Ok(()),
                 }
+            }
+        },
+        Command::Config { action } => match action {
+            ConfigAction::Show => {
+                let cfg = kex::config::Config::load().unwrap_or_default();
+                println!("prefix = \"{}\"", cfg.prefix.to_config_string());
+                println!("status_bar = {}", cfg.status_bar);
+                Ok(())
+            }
+            ConfigAction::Path => {
+                println!("{}", kex::config::config_path().display());
+                Ok(())
             }
         },
     }

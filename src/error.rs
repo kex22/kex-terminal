@@ -10,6 +10,8 @@ pub enum KexError {
     Server(String),
     #[error("IPC error: {0}")]
     Ipc(String),
+    #[error("Config error: {0}")]
+    Config(String),
 }
 
 pub type Result<T> = std::result::Result<T, KexError>;

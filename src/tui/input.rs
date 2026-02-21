@@ -1,5 +1,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
+use crate::config::PrefixKey;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -7,9 +9,12 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn status_text(&self, terminal_name: &str) -> String {
+    pub fn status_text(&self, terminal_name: &str, prefix: &PrefixKey) -> String {
         match self {
-            Mode::Normal => format!(" [NORMAL] {terminal_name} | Ctrl-a: command mode"),
+            Mode::Normal => {
+                let key_name = prefix.display_name();
+                format!(" [NORMAL] {terminal_name} | {key_name}: command mode")
+            }
             Mode::Command => {
                 " [COMMAND] h/j/k/l:nav s:split-h v:split-v n:new x:close Esc:back".into()
             }
@@ -43,6 +48,7 @@ pub enum Action {
 
 pub struct InputHandler {
     mode: Mode,
+    prefix: PrefixKey,
 }
 
 impl Default for InputHandler {
@@ -53,7 +59,17 @@ impl Default for InputHandler {
 
 impl InputHandler {
     pub fn new() -> Self {
-        Self { mode: Mode::Normal }
+        Self {
+            mode: Mode::Normal,
+            prefix: PrefixKey::default(),
+        }
+    }
+
+    pub fn with_prefix(prefix: PrefixKey) -> Self {
+        Self {
+            mode: Mode::Normal,
+            prefix,
+        }
     }
 
     pub fn mode(&self) -> Mode {
@@ -71,7 +87,7 @@ impl InputHandler {
     }
 
     fn handle_normal(&mut self, key: &KeyEvent) -> Action {
-        if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.code == self.prefix.code && key.modifiers.contains(self.prefix.modifiers) {
             self.mode = Mode::Command;
             return Action::ModeChanged(Mode::Command);
         }

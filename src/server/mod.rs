@@ -1,5 +1,6 @@
 pub mod daemon;
 pub mod pid;
+pub mod state;
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use crate::error::{KexError, Result};
 use crate::ipc;
 use crate::ipc::codec::{read_message, write_message};
 use crate::ipc::message::{Request, Response, StreamMessage, ViewInfo};
+use crate::server::state::StatePersister;
 use crate::terminal::manager::TerminalManager;
 use crate::view::manager::ViewManager;
 
@@ -18,6 +20,7 @@ pub struct Server {
     shutdown: Arc<Notify>,
     manager: Arc<Mutex<TerminalManager>>,
     view_manager: Arc<Mutex<ViewManager>>,
+    persister: StatePersister,
 }
 
 impl Server {
@@ -36,11 +39,19 @@ impl Server {
         let listener = UnixListener::bind(&sock_path)?;
         pid::write_pid()?;
 
+        // Clean stale state from previous run (PTYs are dead after restart)
+        let _ = std::fs::remove_file(state::state_path());
+
+        let manager = Arc::new(Mutex::new(TerminalManager::new()));
+        let view_manager = Arc::new(Mutex::new(ViewManager::new()));
+        let persister = StatePersister::spawn(manager.clone(), view_manager.clone());
+
         let server = Server {
             listener,
             shutdown: Arc::new(Notify::new()),
-            manager: Arc::new(Mutex::new(TerminalManager::new())),
-            view_manager: Arc::new(Mutex::new(ViewManager::new())),
+            manager,
+            view_manager,
+            persister,
         };
         server.run().await
     }
@@ -76,21 +87,35 @@ impl Server {
                     let notify = shutdown.clone();
                     let mgr = self.manager.clone();
                     let vmgr = self.view_manager.clone();
+                    let persist = self.persister.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, notify, mgr, vmgr).await {
+                        if let Err(e) = handle_connection(stream, notify, mgr, vmgr, persist).await {
                             eprintln!("connection error: {e}");
                         }
                     });
                 }
                 _ = shutdown.notified() => {
-                    Self::cleanup()?;
+                    self.shutdown().await?;
                     return Ok(());
                 }
             }
         }
     }
 
-    fn cleanup() -> Result<()> {
+    async fn shutdown(self) -> Result<()> {
+        // Save final state
+        self.persister.notify();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Kill all terminals (sends SIGHUP to shell processes)
+        let mut mgr = self.manager.lock().await;
+        let ids: Vec<String> = mgr.list().into_iter().map(|t| t.id).collect();
+        for id in ids {
+            let _ = mgr.kill(&id);
+        }
+        drop(mgr);
+
+        // Clean up socket and PID
         let _ = std::fs::remove_file(ipc::socket_path());
         pid::remove_pid()?;
         Ok(())
@@ -102,8 +127,17 @@ async fn handle_connection(
     shutdown: Arc<Notify>,
     manager: Arc<Mutex<TerminalManager>>,
     view_manager: Arc<Mutex<ViewManager>>,
+    persister: StatePersister,
 ) -> Result<()> {
     let req: Request = read_message(&mut stream).await?;
+    let is_mutation = matches!(
+        req,
+        Request::TerminalCreate { .. }
+            | Request::TerminalKill { .. }
+            | Request::ViewCreate { .. }
+            | Request::ViewDelete { .. }
+            | Request::ViewAddTerminal { .. }
+    );
     let resp = match req {
         Request::ServerStop => {
             shutdown.notify_one();
@@ -205,8 +239,23 @@ async fn handle_connection(
                 }
             }
         }
+        Request::ViewAttach { id } => {
+            let vmgr = view_manager.lock().await;
+            match vmgr.get(&id) {
+                Some(v) => Response::ViewAttach {
+                    terminal_ids: v.terminal_ids.clone(),
+                },
+                None => Response::Error {
+                    message: format!("view not found: {id}"),
+                },
+            }
+        }
     };
-    write_message(&mut stream, &resp).await
+    let result = write_message(&mut stream, &resp).await;
+    if is_mutation {
+        persister.notify();
+    }
+    result
 }
 
 async fn handle_attach(
