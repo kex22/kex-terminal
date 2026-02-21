@@ -65,7 +65,9 @@ kex-terminal/
 │   └── tui/              ← TUI 渲染层（crossterm + vt100）
 │       ├── vterm.rs      ← 虚拟终端缓冲（vt100 封装 + dirty tracking）
 │       ├── screen.rs     ← 屏幕区域管理（Rect、pane/status bar 划分）
-│       └── renderer.rs   ← 渲染器（全量/差量行级渲染）
+│       ├── renderer.rs   ← 渲染器（全量/差量行级渲染 + 分隔线）
+│       ├── layout.rs     ← Pane 布局二叉树（分割/导航/调整/分隔线计算）
+│       └── input.rs      ← 模式系统 + 按键映射（Normal/Command）
 ├── protocol/
 │   ├── schemas/          ← JSON Schema 定义
 │   ├── fixtures/         ← 跨项目测试用例
