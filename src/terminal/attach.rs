@@ -35,8 +35,7 @@ pub async fn attach(mut stream: UnixStream) -> Result<()> {
     // socket → stdout
     let stdout_task = tokio::spawn(async move {
         loop {
-            let msg: std::result::Result<StreamMessage, _> =
-                read_message(&mut sock_read).await;
+            let msg: std::result::Result<StreamMessage, _> = read_message(&mut sock_read).await;
             match msg {
                 Ok(StreamMessage::Data(data)) => {
                     let mut stdout = std::io::stdout().lock();

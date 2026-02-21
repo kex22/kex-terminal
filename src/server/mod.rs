@@ -199,8 +199,7 @@ async fn handle_attach(
     let sock_read_task = tokio::spawn(async move {
         use crate::ipc::codec::read_message;
         loop {
-            let msg: std::result::Result<StreamMessage, _> =
-                read_message(&mut sock_read).await;
+            let msg: std::result::Result<StreamMessage, _> = read_message(&mut sock_read).await;
             match msg {
                 Ok(StreamMessage::Data(data)) => {
                     let Ok(mut w) = pty_writer.lock() else { break };
@@ -210,7 +209,7 @@ async fn handle_attach(
                 }
                 Ok(StreamMessage::Resize { cols, rows }) => {
                     let _ = pty_resizer.resize(cols, rows);
-                    }
+                }
                 Ok(StreamMessage::Detach) | Err(_) => break,
             }
         }

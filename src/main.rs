@@ -58,8 +58,12 @@ fn main() {
     let cli = Cli::parse();
 
     // Daemonize before tokio runtime is created
-    if matches!(cli.command, Command::Server { action: ServerAction::Start })
-        && let Err(e) = kex::server::daemon::daemonize()
+    if matches!(
+        cli.command,
+        Command::Server {
+            action: ServerAction::Start
+        }
+    ) && let Err(e) = kex::server::daemon::daemonize()
     {
         eprintln!("Error: {e}");
         std::process::exit(1);
@@ -102,10 +106,7 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                             Ok(())
                         } else {
                             let mut client = IpcClient::connect().await?;
-                            match client
-                                .send(Request::TerminalAttach { id })
-                                .await?
-                            {
+                            match client.send(Request::TerminalAttach { id }).await? {
                                 Response::Ok => {
                                     kex::terminal::attach::attach(client.into_stream()).await
                                 }
@@ -150,9 +151,7 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
             TerminalAction::Attach { id } => {
                 let mut client = IpcClient::connect().await?;
                 match client.send(Request::TerminalAttach { id }).await? {
-                    Response::Ok => {
-                        kex::terminal::attach::attach(client.into_stream()).await
-                    }
+                    Response::Ok => kex::terminal::attach::attach(client.into_stream()).await,
                     Response::Error { message } => Err(KexError::Server(message)),
                     _ => Ok(()),
                 }

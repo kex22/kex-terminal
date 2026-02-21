@@ -17,9 +17,7 @@ pub async fn write_message<T: Serialize>(
     Ok(())
 }
 
-pub async fn read_message<T: DeserializeOwned>(
-    stream: &mut (impl AsyncRead + Unpin),
-) -> Result<T> {
+pub async fn read_message<T: DeserializeOwned>(stream: &mut (impl AsyncRead + Unpin)) -> Result<T> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
