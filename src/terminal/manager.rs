@@ -29,11 +29,14 @@ impl TerminalManager {
     }
 
     pub fn create(&mut self, name: Option<String>) -> Result<String> {
-        let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let mut id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        while self.terminals.contains_key(&id) {
+            id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        }
         let pty = Pty::spawn()?;
         let terminal = Terminal {
             id: id.clone(),
-            name: name.clone(),
+            name,
             pty,
             created_at: chrono_now(),
         };
@@ -67,11 +70,6 @@ impl TerminalManager {
             .and_then(|id| self.terminals.get(&id))
     }
 
-    pub fn get_mut(&mut self, id_or_name: &str) -> Option<&mut Terminal> {
-        self.resolve_id(id_or_name)
-            .and_then(|id| self.terminals.get_mut(&id))
-    }
-
     pub fn resolve_id(&self, id_or_name: &str) -> Option<String> {
         if self.terminals.contains_key(id_or_name) {
             return Some(id_or_name.to_string());
@@ -84,10 +82,22 @@ impl TerminalManager {
 }
 
 fn chrono_now() -> String {
-    let d = std::time::SystemTime::now()
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}", d.as_secs())
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs, &mut tm);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min
+        )
+    }
 }
 
 #[cfg(test)]

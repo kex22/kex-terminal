@@ -17,13 +17,11 @@ pub fn socket_path() -> PathBuf {
 
 pub fn ensure_socket_dir() -> Result<()> {
     let dir = socket_dir();
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }

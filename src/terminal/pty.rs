@@ -7,8 +7,7 @@ use crate::error::{KexError, Result};
 
 pub struct Pty {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    reader: Option<Box<dyn Read + Send>>,
-    writer: Option<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -53,10 +52,6 @@ impl Pty {
             .spawn_command(cmd)
             .map_err(|e| KexError::Server(format!("spawn: {e}")))?;
 
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| KexError::Server(format!("clone reader: {e}")))?;
         let writer = pair
             .master
             .take_writer()
@@ -64,22 +59,23 @@ impl Pty {
 
         Ok(Pty {
             master: Arc::new(Mutex::new(pair.master)),
-            reader: Some(reader),
-            writer: Some(writer),
+            writer: Arc::new(Mutex::new(writer)),
             child,
         })
     }
 
-    pub fn take_reader(&mut self) -> Result<Box<dyn Read + Send>> {
-        self.reader
-            .take()
-            .ok_or_else(|| KexError::Server("reader already taken".into()))
+    pub fn clone_reader(&self) -> Result<Box<dyn Read + Send>> {
+        let master = self
+            .master
+            .lock()
+            .map_err(|_| KexError::Server("pty mutex poisoned".into()))?;
+        master
+            .try_clone_reader()
+            .map_err(|e| KexError::Server(format!("clone reader: {e}")))
     }
 
-    pub fn take_writer(&mut self) -> Result<Box<dyn Write + Send>> {
-        self.writer
-            .take()
-            .ok_or_else(|| KexError::Server("writer already taken".into()))
+    pub fn clone_writer(&self) -> Arc<Mutex<Box<dyn Write + Send>>> {
+        self.writer.clone()
     }
 
     pub fn clone_resizer(&self) -> PtyResizer {
@@ -89,18 +85,7 @@ impl Pty {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let master = self
-            .master
-            .lock()
-            .map_err(|_| KexError::Server("pty mutex poisoned".into()))?;
-        master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| KexError::Server(format!("resize: {e}")))
+        self.clone_resizer().resize(cols, rows)
     }
 
     pub fn kill(&mut self) -> Result<()> {

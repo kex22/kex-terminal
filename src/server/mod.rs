@@ -1,6 +1,7 @@
 pub mod daemon;
 pub mod pid;
 
+use std::io::Write as _;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
@@ -46,12 +47,18 @@ impl Server {
 
         let sig_shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            let mut sigterm =
+            let Ok(mut sigterm) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to register SIGTERM");
-            let mut sigint =
+            else {
+                eprintln!("failed to register SIGTERM handler");
+                return;
+            };
+            let Ok(mut sigint) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    .expect("failed to register SIGINT");
+            else {
+                eprintln!("failed to register SIGINT handler");
+                return;
+            };
             tokio::select! {
                 _ = sigterm.recv() => {}
                 _ = sigint.recv() => {}
@@ -133,10 +140,10 @@ async fn handle_attach(
     manager: Arc<Mutex<TerminalManager>>,
     id: &str,
 ) -> Result<()> {
-    // Validate terminal exists and take reader/writer
-    let (mut pty_reader, mut pty_writer, pty_resizer) = {
-        let mut mgr = manager.lock().await;
-        let terminal = match mgr.get_mut(id) {
+    // Validate terminal exists and clone reader/writer (non-destructive)
+    let (mut pty_reader, pty_writer, pty_resizer) = {
+        let mgr = manager.lock().await;
+        let terminal = match mgr.get(id) {
             Some(t) => t,
             None => {
                 let resp = Response::Error {
@@ -145,8 +152,8 @@ async fn handle_attach(
                 return write_message(&mut stream, &resp).await;
             }
         };
-        let reader = terminal.pty.take_reader()?;
-        let writer = terminal.pty.take_writer()?;
+        let reader = terminal.pty.clone_reader()?;
+        let writer = terminal.pty.clone_writer();
         let resizer = terminal.pty.clone_resizer();
         (reader, writer, resizer)
     };
@@ -161,7 +168,11 @@ async fn handle_attach(
         let mut buf = [0u8; 4096];
         loop {
             match pty_reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(e) => {
+                    eprintln!("pty read error: {e}");
+                    break;
+                }
                 Ok(n) => {
                     if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
@@ -192,7 +203,8 @@ async fn handle_attach(
                 read_message(&mut sock_read).await;
             match msg {
                 Ok(StreamMessage::Data(data)) => {
-                    if pty_writer.write_all(&data).is_err() {
+                    let Ok(mut w) = pty_writer.lock() else { break };
+                    if w.write_all(&data).is_err() {
                         break;
                     }
                 }

@@ -1,7 +1,9 @@
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::error::Result;
+use crate::error::{KexError, Result};
+
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 pub async fn write_message<T: Serialize>(
     stream: &mut (impl AsyncWrite + Unpin),
@@ -21,6 +23,9 @@ pub async fn read_message<T: DeserializeOwned>(
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(KexError::Ipc(format!("message too large: {len} bytes")));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)
