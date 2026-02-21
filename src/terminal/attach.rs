@@ -157,6 +157,22 @@ async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16) 
                             render_all_panes(&mut renderer, &layout, &mut vterms, &screen, &input, terminal_name)?;
                         }
                     }
+                    Action::ViewList => {
+                        if let Ok(text) = fetch_view_list_text().await {
+                            let bar = screen.status_bar_area();
+                            renderer.render_status_bar(&text, &bar)?;
+                            renderer.flush()?;
+                        }
+                    }
+                    Action::ViewSwitch(n) => {
+                        if let Ok(info) = fetch_view_by_index(n).await {
+                            switch_view(
+                                &info.terminal_ids, &mut layout, &mut vterms,
+                                &mut writers, &mut read_tasks, &split_tx, &screen,
+                                &mut renderer, &input, terminal_name,
+                            ).await?;
+                        }
+                    }
                     Action::Detach => break,
                     _ => {}
                 }
@@ -371,6 +387,139 @@ async fn handle_resize(
     terminal_name: &str,
 ) -> Result<()> {
     screen.resize(new_rows, new_cols);
+    resize_all_vterms(layout, vterms, writers, screen).await?;
+    render_all_panes(renderer, layout, vterms, screen, input, terminal_name)?;
+    Ok(())
+}
+
+use crate::ipc::message::ViewInfo;
+
+async fn fetch_view_list_text() -> Result<String> {
+    let mut client = IpcClient::connect().await?;
+    match client.send(Request::ViewList).await? {
+        Response::ViewList { views } => {
+            if views.is_empty() {
+                return Ok(" [VIEWS] (none)".into());
+            }
+            let names: Vec<String> = views
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let label = v.name.as_deref().unwrap_or(&v.id);
+                    format!("{}:{label}", i + 1)
+                })
+                .collect();
+            Ok(format!(" [VIEWS] {}", names.join(" | ")))
+        }
+        _ => Ok(" [VIEWS] error".into()),
+    }
+}
+
+async fn fetch_view_by_index(n: usize) -> Result<ViewInfo> {
+    let mut client = IpcClient::connect().await?;
+    match client.send(Request::ViewList).await? {
+        Response::ViewList { views } => {
+            if n == 0 || n > views.len() {
+                return Err(crate::error::KexError::Server(format!(
+                    "view index {n} out of range"
+                )));
+            }
+            Ok(views.into_iter().nth(n - 1).unwrap())
+        }
+        _ => Err(crate::error::KexError::Server("unexpected response".into())),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn switch_view(
+    terminal_ids: &[String],
+    layout: &mut PaneLayout,
+    vterms: &mut HashMap<String, VirtualTerminal>,
+    writers: &mut HashMap<String, OwnedWriteHalf>,
+    read_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    tx: &tokio::sync::mpsc::Sender<(String, Vec<u8>)>,
+    screen: &Screen,
+    renderer: &mut Renderer<io::Stdout>,
+    input: &InputHandler,
+    terminal_name: &str,
+) -> Result<()> {
+    if terminal_ids.is_empty() {
+        return Ok(());
+    }
+
+    let new_set: std::collections::HashSet<&String> = terminal_ids.iter().collect();
+    let old_ids: Vec<String> = writers.keys().cloned().collect();
+
+    // Detach terminals not in the new view
+    for id in &old_ids {
+        if !new_set.contains(id) {
+            if let Some(task) = read_tasks.remove(id) {
+                task.abort();
+            }
+            if let Some(mut w) = writers.remove(id) {
+                let _ = write_message(&mut w, &StreamMessage::Detach).await;
+            }
+            vterms.remove(id);
+        }
+    }
+
+    // Rebuild layout with first terminal
+    let first = &terminal_ids[0];
+    *layout = PaneLayout::new(first.clone());
+
+    // Attach terminals not already connected
+    let pane_area = screen.pane_area();
+    for tid in terminal_ids {
+        if !writers.contains_key(tid) {
+            let mut client = IpcClient::connect().await?;
+            if !matches!(
+                client
+                    .send(Request::TerminalAttach { id: tid.clone() })
+                    .await?,
+                Response::Ok
+            ) {
+                continue;
+            }
+            let stream = client.into_stream();
+            let (sock_read, mut sock_write) = stream.into_split();
+            let _ = write_message(
+                &mut sock_write,
+                &StreamMessage::Resize {
+                    cols: pane_area.width,
+                    rows: pane_area.height,
+                },
+            )
+            .await;
+            writers.insert(tid.clone(), sock_write);
+            vterms.insert(
+                tid.clone(),
+                VirtualTerminal::new(pane_area.height, pane_area.width),
+            );
+            let tx_clone = tx.clone();
+            let tid_clone = tid.clone();
+            read_tasks.insert(
+                tid.clone(),
+                tokio::spawn(async move {
+                    let mut sock_read = sock_read;
+                    while let Ok(StreamMessage::Data(data)) = read_message(&mut sock_read).await {
+                        if tx_clone.send((tid_clone.clone(), data)).await.is_err() {
+                            break;
+                        }
+                    }
+                }),
+            );
+        }
+        // Add additional terminals as splits
+        if tid != first
+            && !layout
+                .compute_rects(pane_area)
+                .iter()
+                .any(|(id, _)| id == tid)
+        {
+            layout.split(SplitDirection::Vertical, tid.clone());
+        }
+    }
+
     resize_all_vterms(layout, vterms, writers, screen).await?;
     render_all_panes(renderer, layout, vterms, screen, input, terminal_name)?;
     Ok(())

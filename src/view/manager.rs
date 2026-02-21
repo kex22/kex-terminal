@@ -189,6 +189,18 @@ mod tests {
     }
 
     #[test]
+    fn shared_terminal_survives_view_delete() {
+        let mut mgr = ViewManager::new();
+        let v1 = mgr.create(Some("dev".into()), "t1".into());
+        let v2 = mgr.create(Some("ops".into()), "t1".into());
+        mgr.add_terminal(&v2, "t2");
+        // Delete v1 — t1 should still be in v2
+        mgr.delete(&v1).unwrap();
+        let view2 = mgr.get(&v2).unwrap();
+        assert_eq!(view2.terminal_ids, vec!["t1", "t2"]);
+    }
+
+    #[test]
     fn update_layout_stores_value() {
         let mut mgr = ViewManager::new();
         let id = mgr.create(None, "t1".into());

@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::error::{KexError, Result};
 use crate::ipc;
 use crate::ipc::codec::{read_message, write_message};
-use crate::ipc::message::{Request, Response, StreamMessage};
+use crate::ipc::message::{Request, Response, StreamMessage, ViewInfo};
 use crate::terminal::manager::TerminalManager;
 use crate::view::manager::ViewManager;
 
@@ -164,6 +164,44 @@ async fn handle_connection(
                 Err(e) => Response::Error {
                     message: e.to_string(),
                 },
+            }
+        }
+        Request::ViewShow { id } => {
+            let vmgr = view_manager.lock().await;
+            match vmgr.get(&id) {
+                Some(v) => Response::ViewShow {
+                    view: ViewInfo {
+                        id: v.id.clone(),
+                        name: v.name.clone(),
+                        terminal_ids: v.terminal_ids.clone(),
+                        created_at: v.created_at.clone(),
+                    },
+                },
+                None => Response::Error {
+                    message: format!("view not found: {id}"),
+                },
+            }
+        }
+        Request::ViewAddTerminal {
+            view_id,
+            terminal_id,
+        } => {
+            let mgr = manager.lock().await;
+            if mgr.get(&terminal_id).is_none() {
+                Response::Error {
+                    message: format!("terminal not found: {terminal_id}"),
+                }
+            } else {
+                drop(mgr);
+                let mut vmgr = view_manager.lock().await;
+                if vmgr.get(&view_id).is_none() {
+                    Response::Error {
+                        message: format!("view not found: {view_id}"),
+                    }
+                } else {
+                    vmgr.add_terminal(&view_id, &terminal_id);
+                    Response::Ok
+                }
             }
         }
     };

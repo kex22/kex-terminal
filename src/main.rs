@@ -76,6 +76,18 @@ enum ViewAction {
         /// View ID or name
         id: String,
     },
+    /// Show view details
+    Show {
+        /// View ID or name
+        id: String,
+    },
+    /// Add a terminal to a view
+    Add {
+        /// View ID or name
+        view: String,
+        /// Terminal ID
+        terminal: String,
+    },
 }
 
 fn main() {
@@ -227,6 +239,34 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
             ViewAction::Rm { id } => {
                 let mut client = IpcClient::connect().await?;
                 match client.send(Request::ViewDelete { id }).await? {
+                    Response::Ok => Ok(()),
+                    Response::Error { message } => Err(KexError::Server(message)),
+                    _ => Ok(()),
+                }
+            }
+            ViewAction::Show { id } => {
+                let mut client = IpcClient::connect().await?;
+                match client.send(Request::ViewShow { id }).await? {
+                    Response::ViewShow { view } => {
+                        println!("ID:        {}", view.id);
+                        println!("Name:      {}", view.name.as_deref().unwrap_or("-"));
+                        println!("Terminals: {}", view.terminal_ids.join(", "));
+                        println!("Created:   {}", view.created_at);
+                        Ok(())
+                    }
+                    Response::Error { message } => Err(KexError::Server(message)),
+                    _ => Ok(()),
+                }
+            }
+            ViewAction::Add { view, terminal } => {
+                let mut client = IpcClient::connect().await?;
+                match client
+                    .send(Request::ViewAddTerminal {
+                        view_id: view,
+                        terminal_id: terminal,
+                    })
+                    .await?
+                {
                     Response::Ok => Ok(()),
                     Response::Error { message } => Err(KexError::Server(message)),
                     _ => Ok(()),

@@ -21,6 +21,13 @@ pub enum Request {
     ViewDelete {
         id: String,
     },
+    ViewShow {
+        id: String,
+    },
+    ViewAddTerminal {
+        view_id: String,
+        terminal_id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,6 +38,7 @@ pub enum Response {
     TerminalList { terminals: Vec<TerminalInfo> },
     ViewCreated { id: String },
     ViewList { views: Vec<ViewInfo> },
+    ViewShow { view: ViewInfo },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
