@@ -3,3 +3,4 @@ pub mod ipc;
 pub mod server;
 pub mod terminal;
 pub mod tui;
+pub mod view;

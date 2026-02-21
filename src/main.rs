@@ -19,6 +19,11 @@ enum Command {
         #[command(subcommand)]
         action: TerminalAction,
     },
+    /// Manage views
+    View {
+        #[command(subcommand)]
+        action: ViewAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -50,6 +55,25 @@ enum TerminalAction {
     /// Attach to a terminal
     Attach {
         /// Terminal ID or name
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ViewAction {
+    /// Create a named view
+    Create {
+        /// View name
+        #[arg(long)]
+        name: Option<String>,
+        /// Initial terminal ID
+        terminal: String,
+    },
+    /// List all views
+    Ls,
+    /// Delete a view
+    Rm {
+        /// View ID or name
         id: String,
     },
 }
@@ -158,6 +182,52 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                     .await?
                 {
                     Response::Ok => kex::terminal::attach::attach(client.into_stream(), &id).await,
+                    Response::Error { message } => Err(KexError::Server(message)),
+                    _ => Ok(()),
+                }
+            }
+        },
+        Command::View { action } => match action {
+            ViewAction::Create { name, terminal } => {
+                let mut client = IpcClient::connect().await?;
+                match client
+                    .send(Request::ViewCreate {
+                        name,
+                        terminal_id: terminal,
+                    })
+                    .await?
+                {
+                    Response::ViewCreated { id } => {
+                        println!("{id}");
+                        Ok(())
+                    }
+                    Response::Error { message } => Err(KexError::Server(message)),
+                    _ => Ok(()),
+                }
+            }
+            ViewAction::Ls => {
+                let mut client = IpcClient::connect().await?;
+                if let Response::ViewList { views } = client.send(Request::ViewList).await? {
+                    if views.is_empty() {
+                        println!("no views");
+                    } else {
+                        println!("{:<10} {:<15} TERMINALS", "ID", "NAME");
+                        for v in views {
+                            println!(
+                                "{:<10} {:<15} {}",
+                                v.id,
+                                v.name.as_deref().unwrap_or("-"),
+                                v.terminal_ids.join(", ")
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ViewAction::Rm { id } => {
+                let mut client = IpcClient::connect().await?;
+                match client.send(Request::ViewDelete { id }).await? {
+                    Response::Ok => Ok(()),
                     Response::Error { message } => Err(KexError::Server(message)),
                     _ => Ok(()),
                 }

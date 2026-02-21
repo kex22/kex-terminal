@@ -11,11 +11,13 @@ use crate::ipc;
 use crate::ipc::codec::{read_message, write_message};
 use crate::ipc::message::{Request, Response, StreamMessage};
 use crate::terminal::manager::TerminalManager;
+use crate::view::manager::ViewManager;
 
 pub struct Server {
     listener: UnixListener,
     shutdown: Arc<Notify>,
     manager: Arc<Mutex<TerminalManager>>,
+    view_manager: Arc<Mutex<ViewManager>>,
 }
 
 impl Server {
@@ -38,6 +40,7 @@ impl Server {
             listener,
             shutdown: Arc::new(Notify::new()),
             manager: Arc::new(Mutex::new(TerminalManager::new())),
+            view_manager: Arc::new(Mutex::new(ViewManager::new())),
         };
         server.run().await
     }
@@ -72,8 +75,9 @@ impl Server {
                     let (stream, _) = result?;
                     let notify = shutdown.clone();
                     let mgr = self.manager.clone();
+                    let vmgr = self.view_manager.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, notify, mgr).await {
+                        if let Err(e) = handle_connection(stream, notify, mgr, vmgr).await {
                             eprintln!("connection error: {e}");
                         }
                     });
@@ -97,6 +101,7 @@ async fn handle_connection(
     mut stream: UnixStream,
     shutdown: Arc<Notify>,
     manager: Arc<Mutex<TerminalManager>>,
+    view_manager: Arc<Mutex<ViewManager>>,
 ) -> Result<()> {
     let req: Request = read_message(&mut stream).await?;
     let resp = match req {
@@ -130,6 +135,24 @@ async fn handle_connection(
         }
         Request::TerminalAttach { id } => {
             return handle_attach(stream, manager, &id).await;
+        }
+        Request::ViewCreate { name, terminal_id } => {
+            let mut vmgr = view_manager.lock().await;
+            let id = vmgr.create(name, terminal_id);
+            Response::ViewCreated { id }
+        }
+        Request::ViewList => {
+            let vmgr = view_manager.lock().await;
+            Response::ViewList { views: vmgr.list() }
+        }
+        Request::ViewDelete { id } => {
+            let mut vmgr = view_manager.lock().await;
+            match vmgr.delete(&id) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
         }
     };
     write_message(&mut stream, &resp).await

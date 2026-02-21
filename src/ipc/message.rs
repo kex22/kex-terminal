@@ -3,10 +3,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     ServerStop,
-    TerminalCreate { name: Option<String> },
+    TerminalCreate {
+        name: Option<String>,
+    },
     TerminalList,
-    TerminalKill { id: String },
-    TerminalAttach { id: String },
+    TerminalKill {
+        id: String,
+    },
+    TerminalAttach {
+        id: String,
+    },
+    ViewCreate {
+        name: Option<String>,
+        terminal_id: String,
+    },
+    ViewList,
+    ViewDelete {
+        id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15,12 +29,22 @@ pub enum Response {
     Error { message: String },
     TerminalCreated { id: String },
     TerminalList { terminals: Vec<TerminalInfo> },
+    ViewCreated { id: String },
+    ViewList { views: Vec<ViewInfo> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalInfo {
     pub id: String,
     pub name: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewInfo {
+    pub id: String,
+    pub name: Option<String>,
+    pub terminal_ids: Vec<String>,
     pub created_at: String,
 }
 
