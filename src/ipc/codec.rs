@@ -2,8 +2,12 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{KexError, Result};
+use crate::ipc::message::BinaryFrame;
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+const FRAME_TYPE_DATA: u8 = 0x01;
+const FRAME_TYPE_RESIZE: u8 = 0x02;
+const FRAME_TYPE_DETACH: u8 = 0x03;
 
 pub async fn write_message<T: Serialize>(
     stream: &mut (impl AsyncWrite + Unpin),
@@ -27,6 +31,84 @@ pub async fn read_message<T: DeserializeOwned>(stream: &mut (impl AsyncRead + Un
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)
+}
+
+pub async fn write_binary_frame(
+    stream: &mut (impl AsyncWrite + Unpin),
+    terminal_id: &str,
+    frame: &BinaryFrame,
+) -> Result<()> {
+    let type_byte = match frame {
+        BinaryFrame::Data(_) => FRAME_TYPE_DATA,
+        BinaryFrame::Resize { .. } => FRAME_TYPE_RESIZE,
+        BinaryFrame::Detach => FRAME_TYPE_DETACH,
+    };
+
+    // Header: [1B type][8B tid][4B len]
+    let mut header = [0u8; 13];
+    header[0] = type_byte;
+    let tid_bytes = terminal_id.as_bytes();
+    let copy_len = tid_bytes.len().min(8);
+    header[1..1 + copy_len].copy_from_slice(&tid_bytes[..copy_len]);
+
+    match frame {
+        BinaryFrame::Data(data) => {
+            let len = (data.len() as u32).to_be_bytes();
+            header[9..13].copy_from_slice(&len);
+            stream.write_all(&header).await?;
+            stream.write_all(data).await?;
+        }
+        BinaryFrame::Resize { cols, rows } => {
+            header[9..13].copy_from_slice(&4u32.to_be_bytes());
+            stream.write_all(&header).await?;
+            stream.write_all(&cols.to_be_bytes()).await?;
+            stream.write_all(&rows.to_be_bytes()).await?;
+        }
+        BinaryFrame::Detach => {
+            // len = 0
+            stream.write_all(&header).await?;
+        }
+    }
+    stream.flush().await?;
+    Ok(())
+}
+
+pub async fn read_binary_frame(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> Result<(String, BinaryFrame)> {
+    let mut header = [0u8; 13];
+    stream.read_exact(&mut header).await?;
+
+    let type_byte = header[0];
+    let tid = std::str::from_utf8(&header[1..9])
+        .unwrap_or("")
+        .trim_end_matches('\0')
+        .to_string();
+    let payload_len = u32::from_be_bytes([header[9], header[10], header[11], header[12]]) as usize;
+
+    if payload_len > MAX_MESSAGE_SIZE {
+        return Err(KexError::Ipc(format!("frame too large: {payload_len} bytes")));
+    }
+
+    let frame = match type_byte {
+        FRAME_TYPE_DATA => {
+            let mut buf = vec![0u8; payload_len];
+            stream.read_exact(&mut buf).await?;
+            BinaryFrame::Data(buf)
+        }
+        FRAME_TYPE_RESIZE => {
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await?;
+            BinaryFrame::Resize {
+                cols: u16::from_be_bytes([buf[0], buf[1]]),
+                rows: u16::from_be_bytes([buf[2], buf[3]]),
+            }
+        }
+        FRAME_TYPE_DETACH => BinaryFrame::Detach,
+        _ => return Err(KexError::Ipc(format!("unknown frame type: {type_byte:#x}"))),
+    };
+
+    Ok((tid, frame))
 }
 
 #[cfg(test)]
@@ -102,5 +184,43 @@ mod tests {
         write_message(&mut server, &resp).await.unwrap();
         let decoded: Response = read_message(&mut client).await.unwrap();
         assert!(matches!(decoded, Response::ViewAttach { terminal_ids, layout: Some(_), focused: Some(f) } if terminal_ids.len() == 2 && f == "t2"));
+    }
+
+    #[tokio::test]
+    async fn binary_frame_roundtrip_data() {
+        let (mut client, mut server) = paired_streams().await;
+        let frame = BinaryFrame::Data(vec![1, 2, 3, 4]);
+        write_binary_frame(&mut client, "abcd1234", &frame).await.unwrap();
+        let (tid, decoded) = read_binary_frame(&mut server).await.unwrap();
+        assert_eq!(tid, "abcd1234");
+        assert_eq!(decoded, BinaryFrame::Data(vec![1, 2, 3, 4]));
+    }
+
+    #[tokio::test]
+    async fn binary_frame_roundtrip_resize() {
+        let (mut client, mut server) = paired_streams().await;
+        let frame = BinaryFrame::Resize { cols: 120, rows: 40 };
+        write_binary_frame(&mut client, "term0001", &frame).await.unwrap();
+        let (tid, decoded) = read_binary_frame(&mut server).await.unwrap();
+        assert_eq!(tid, "term0001");
+        assert_eq!(decoded, BinaryFrame::Resize { cols: 120, rows: 40 });
+    }
+
+    #[tokio::test]
+    async fn binary_frame_roundtrip_detach() {
+        let (mut client, mut server) = paired_streams().await;
+        write_binary_frame(&mut client, "t1234567", &BinaryFrame::Detach).await.unwrap();
+        let (tid, decoded) = read_binary_frame(&mut server).await.unwrap();
+        assert_eq!(tid, "t1234567");
+        assert_eq!(decoded, BinaryFrame::Detach);
+    }
+
+    #[tokio::test]
+    async fn binary_frame_empty_data() {
+        let (mut client, mut server) = paired_streams().await;
+        let frame = BinaryFrame::Data(vec![]);
+        write_binary_frame(&mut client, "abcd1234", &frame).await.unwrap();
+        let (_, decoded) = read_binary_frame(&mut server).await.unwrap();
+        assert_eq!(decoded, BinaryFrame::Data(vec![]));
     }
 }

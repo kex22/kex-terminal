@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 use crate::config::Config;
 use crate::error::Result;
 use crate::ipc::client::IpcClient;
-use crate::ipc::codec::{read_message, write_message};
-use crate::ipc::message::{Request, Response, StreamMessage, ViewInfo};
+use crate::ipc::codec::{read_binary_frame, write_binary_frame};
+use crate::ipc::message::{BinaryFrame, Request, Response, ViewInfo};
 use crate::tui::input::{Action, InputHandler};
 use crate::tui::layout::{PaneLayout, SplitDirection};
 use crate::tui::renderer::Renderer;
@@ -37,9 +37,10 @@ pub async fn attach_view(
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
     let screen = Screen::new(rows, cols);
     let pane = screen.pane_area();
-    write_message(
+    write_binary_frame(
         &mut stream,
-        &StreamMessage::Resize {
+        terminal_name,
+        &BinaryFrame::Resize {
             cols: pane.width,
             rows: pane.height,
         },
@@ -149,9 +150,10 @@ impl TuiSession {
                 vterm.resize(rect.height, rect.width);
             }
             if let Some(w) = self.writers.get_mut(&tid) {
-                let _ = write_message(
+                let _ = write_binary_frame(
                     w,
-                    &StreamMessage::Resize {
+                    &tid,
+                    &BinaryFrame::Resize {
                         cols: rect.width,
                         rows: rect.height,
                     },
@@ -226,7 +228,7 @@ impl TuiSession {
                 task.abort();
             }
             if let Some(mut w) = self.writers.remove(&closed) {
-                let _ = write_message(&mut w, &StreamMessage::Detach).await;
+                let _ = write_binary_frame(&mut w, &closed, &BinaryFrame::Detach).await;
             }
             self.resize_all_vterms().await?;
             self.render_all()?;
@@ -269,7 +271,7 @@ impl TuiSession {
                     task.abort();
                 }
                 if let Some(mut w) = self.writers.remove(id) {
-                    let _ = write_message(&mut w, &StreamMessage::Detach).await;
+                    let _ = write_binary_frame(&mut w, id, &BinaryFrame::Detach).await;
                 }
                 self.vterms.remove(id);
             }
@@ -290,9 +292,10 @@ impl TuiSession {
                 }
                 let stream = client.into_stream();
                 let (sock_read, mut sock_write) = stream.into_split();
-                let _ = write_message(
+                let _ = write_binary_frame(
                     &mut sock_write,
-                    &StreamMessage::Resize {
+                    tid,
+                    &BinaryFrame::Resize {
                         cols: pane_area.width,
                         rows: pane_area.height,
                     },
@@ -309,7 +312,7 @@ impl TuiSession {
                     tid.clone(),
                     tokio::spawn(async move {
                         let mut sock_read = sock_read;
-                        while let Ok(StreamMessage::Data(data)) = read_message(&mut sock_read).await {
+                        while let Ok((_, BinaryFrame::Data(data))) = read_binary_frame(&mut sock_read).await {
                             if tx_clone.send((tid_clone.clone(), data)).await.is_err() {
                                 break;
                             }
@@ -338,7 +341,7 @@ impl TuiSession {
         self.vterms.insert(id.clone(), VirtualTerminal::new(h, w));
 
         let (sock_read, mut sock_write) = stream.into_split();
-        write_message(&mut sock_write, &StreamMessage::Resize { cols: w, rows: h }).await?;
+        write_binary_frame(&mut sock_write, &id, &BinaryFrame::Resize { cols: w, rows: h }).await?;
         self.writers.insert(id.clone(), sock_write);
 
         let tx_clone = self.tx.clone();
@@ -347,7 +350,7 @@ impl TuiSession {
             id,
             tokio::spawn(async move {
                 let mut sock_read = sock_read;
-                while let Ok(StreamMessage::Data(data)) = read_message(&mut sock_read).await {
+                while let Ok((_, BinaryFrame::Data(data))) = read_binary_frame(&mut sock_read).await {
                     if tx_clone.send((tid.clone(), data)).await.is_err() {
                         break;
                     }
@@ -372,8 +375,8 @@ impl TuiSession {
     }
 
     async fn detach_all(&mut self) {
-        for (_, mut w) in self.writers.drain() {
-            let _ = write_message(&mut w, &StreamMessage::Detach).await;
+        for (tid, mut w) in self.writers.drain() {
+            let _ = write_binary_frame(&mut w, &tid, &BinaryFrame::Detach).await;
         }
     }
 }
@@ -428,7 +431,7 @@ async fn run_tui(init: TuiInit<'_>) -> Result<()> {
         init.terminal_name.to_string(),
         tokio::spawn(async move {
             let mut sock_read = sock_read;
-            while let Ok(StreamMessage::Data(data)) = read_message(&mut sock_read).await {
+            while let Ok((_, BinaryFrame::Data(data))) = read_binary_frame(&mut sock_read).await {
                 if tx_clone.send((initial_id.clone(), data)).await.is_err() {
                     break;
                 }
@@ -471,7 +474,7 @@ async fn run_tui(init: TuiInit<'_>) -> Result<()> {
                     Action::SendToTerminal(bytes) => {
                         let focused = session.layout.focused_terminal().to_string();
                         if let Some(w) = session.writers.get_mut(&focused)
-                            && write_message(w, &StreamMessage::Data(bytes)).await.is_err()
+                            && write_binary_frame(w, &focused, &BinaryFrame::Data(bytes)).await.is_err()
                         {
                             break;
                         }

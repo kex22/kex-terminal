@@ -80,3 +80,10 @@ pub enum StreamMessage {
     Resize { cols: u16, rows: u16 },
     Detach,
 }
+
+#[derive(Debug, PartialEq)]
+pub enum BinaryFrame {
+    Data(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+    Detach,
+}

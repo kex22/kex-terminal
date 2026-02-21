@@ -9,8 +9,8 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::error::{KexError, Result};
 use crate::ipc;
-use crate::ipc::codec::{read_message, write_message};
-use crate::ipc::message::{Request, Response, StreamMessage, ViewInfo};
+use crate::ipc::codec::{read_binary_frame, read_message, write_binary_frame, write_message};
+use crate::ipc::message::{BinaryFrame, Request, Response, ViewInfo};
 use crate::server::state::StatePersister;
 use crate::terminal::manager::TerminalManager;
 use crate::view::manager::ViewManager;
@@ -326,11 +326,11 @@ async fn handle_attach(
         }
     });
 
-    // Channel → socket: forward PTY output as StreamMessage
+    // Channel → socket: forward PTY output as binary frames
+    let tid_write = id.to_string();
     let sock_write_task = tokio::spawn(async move {
-        use crate::ipc::codec::write_message;
         while let Some(data) = rx.recv().await {
-            if write_message(&mut sock_write, &StreamMessage::Data(data))
+            if write_binary_frame(&mut sock_write, &tid_write, &BinaryFrame::Data(data))
                 .await
                 .is_err()
             {
@@ -339,22 +339,20 @@ async fn handle_attach(
         }
     });
 
-    // Socket → PTY: read StreamMessage, write to PTY
+    // Socket → PTY: read binary frames, write to PTY
     let sock_read_task = tokio::spawn(async move {
-        use crate::ipc::codec::read_message;
         loop {
-            let msg: std::result::Result<StreamMessage, _> = read_message(&mut sock_read).await;
-            match msg {
-                Ok(StreamMessage::Data(data)) => {
+            match read_binary_frame(&mut sock_read).await {
+                Ok((_, BinaryFrame::Data(data))) => {
                     let Ok(mut w) = pty_writer.lock() else { break };
                     if w.write_all(&data).is_err() {
                         break;
                     }
                 }
-                Ok(StreamMessage::Resize { cols, rows }) => {
+                Ok((_, BinaryFrame::Resize { cols, rows })) => {
                     let _ = pty_resizer.resize(cols, rows);
                 }
-                Ok(StreamMessage::Detach) | Err(_) => break,
+                Ok((_, BinaryFrame::Detach)) | Err(_) => break,
             }
         }
     });
