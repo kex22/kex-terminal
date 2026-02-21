@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -31,6 +32,15 @@ pub enum Request {
     ViewAttach {
         id: String,
     },
+    ViewUpdateLayout {
+        view_id: String,
+        layout: Value,
+        focused: String,
+    },
+    ViewRemoveTerminal {
+        view_id: String,
+        terminal_id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,7 +52,11 @@ pub enum Response {
     ViewCreated { id: String },
     ViewList { views: Vec<ViewInfo> },
     ViewShow { view: ViewInfo },
-    ViewAttach { terminal_ids: Vec<String> },
+    ViewAttach {
+        terminal_ids: Vec<String>,
+        layout: Option<Value>,
+        focused: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

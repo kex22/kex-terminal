@@ -137,6 +137,8 @@ async fn handle_connection(
             | Request::ViewCreate { .. }
             | Request::ViewDelete { .. }
             | Request::ViewAddTerminal { .. }
+            | Request::ViewUpdateLayout { .. }
+            | Request::ViewRemoveTerminal { .. }
     );
     let resp = match req {
         Request::ServerStop => {
@@ -244,11 +246,30 @@ async fn handle_connection(
             match vmgr.get(&id) {
                 Some(v) => Response::ViewAttach {
                     terminal_ids: v.terminal_ids.clone(),
+                    layout: Some(v.layout.clone()),
+                    focused: Some(v.focused.clone()),
                 },
                 None => Response::Error {
                     message: format!("view not found: {id}"),
                 },
             }
+        }
+        Request::ViewUpdateLayout {
+            view_id,
+            layout,
+            focused,
+        } => {
+            let mut vmgr = view_manager.lock().await;
+            vmgr.update_layout(&view_id, layout, focused);
+            Response::Ok
+        }
+        Request::ViewRemoveTerminal {
+            view_id,
+            terminal_id,
+        } => {
+            let mut vmgr = view_manager.lock().await;
+            vmgr.remove_terminal_from_view(&view_id, &terminal_id);
+            Response::Ok
         }
     };
     let result = write_message(&mut stream, &resp).await;

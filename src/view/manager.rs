@@ -105,6 +105,12 @@ impl ViewManager {
         }
     }
 
+    pub fn remove_terminal_from_view(&mut self, view_id: &str, terminal_id: &str) {
+        if let Some(v) = self.views.get_mut(view_id) {
+            v.terminal_ids.retain(|t| t != terminal_id);
+        }
+    }
+
     pub fn remove_terminal(&mut self, terminal_id: &str) {
         for v in self.views.values_mut() {
             v.terminal_ids.retain(|t| t != terminal_id);
@@ -215,5 +221,17 @@ mod tests {
         mgr.update_layout(&id, layout.clone(), "t1".into());
         assert_eq!(mgr.get(&id).unwrap().layout, layout);
         assert_eq!(mgr.get(&id).unwrap().focused, "t1");
+    }
+
+    #[test]
+    fn remove_terminal_from_specific_view() {
+        let mut mgr = ViewManager::new();
+        let v1 = mgr.create(None, "t1".into());
+        let v2 = mgr.create(None, "t1".into());
+        mgr.add_terminal(&v1, "t2");
+        mgr.remove_terminal_from_view(&v1, "t2");
+        assert_eq!(mgr.get(&v1).unwrap().terminal_ids, vec!["t1"]);
+        // v2 unaffected
+        assert_eq!(mgr.get(&v2).unwrap().terminal_ids, vec!["t1"]);
     }
 }

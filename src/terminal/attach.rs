@@ -20,13 +20,16 @@ use crate::tui::screen::Screen;
 use crate::tui::vterm::VirtualTerminal;
 
 pub async fn attach(stream: UnixStream, terminal_name: &str) -> Result<()> {
-    attach_view(stream, terminal_name, &[]).await
+    attach_view(stream, terminal_name, &[], None, None, None).await
 }
 
 pub async fn attach_view(
     mut stream: UnixStream,
     terminal_name: &str,
     extra_terminals: &[String],
+    view_id: Option<&str>,
+    saved_layout: Option<serde_json::Value>,
+    saved_focused: Option<String>,
 ) -> Result<()> {
     let config = Config::load().unwrap_or_default();
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -46,7 +49,7 @@ pub async fn attach_view(
     terminal::enable_raw_mode()?;
     stdout.execute(cursor::Hide)?;
 
-    let result = run_tui(stream, terminal_name, cols, rows, &config, extra_terminals).await;
+    let result = run_tui(stream, terminal_name, cols, rows, &config, extra_terminals, view_id, saved_layout, saved_focused).await;
 
     let mut stdout = io::stdout();
     let _ = stdout.execute(cursor::Show);
@@ -56,13 +59,17 @@ pub async fn attach_view(
     result
 }
 
-async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16, config: &Config, extra_terminals: &[String]) -> Result<()> {
+async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16, config: &Config, extra_terminals: &[String], view_id: Option<&str>, saved_layout: Option<serde_json::Value>, saved_focused: Option<String>) -> Result<()> {
     let mut screen = Screen::new(rows, cols);
     let mut renderer = Renderer::new(io::stdout());
     let mut input = InputHandler::with_prefix(config.prefix.clone());
 
     // Multi-pane state
-    let mut layout = PaneLayout::new(terminal_name.to_string());
+    let has_saved_layout = matches!(&saved_layout, Some(v) if !v.is_null());
+    let mut layout = match saved_layout {
+        Some(v) if !v.is_null() => PaneLayout::from_value(v, saved_focused.as_deref(), terminal_name),
+        _ => PaneLayout::new(terminal_name.to_string()),
+    };
     let mut vterms: HashMap<String, VirtualTerminal> = HashMap::new();
     let mut writers: HashMap<String, OwnedWriteHalf> = HashMap::new();
 
@@ -105,7 +112,9 @@ async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16, 
             continue;
         }
         let stream = client.into_stream();
-        layout.split(SplitDirection::Vertical, tid.clone());
+        if !has_saved_layout {
+            layout.split(SplitDirection::Vertical, tid.clone());
+        }
         let rects = layout.compute_rects(screen.pane_area());
         let (h, w) = rects
             .iter()
@@ -172,14 +181,14 @@ async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16, 
                         handle_split(
                             SplitDirection::Horizontal, &mut layout, &mut vterms,
                             &mut writers, &mut read_tasks, &split_tx, &screen,
-                            &mut renderer, &input, terminal_name, config,
+                            &mut renderer, &input, terminal_name, config, view_id,
                         ).await?;
                     }
                     Action::PaneSplitVertical => {
                         handle_split(
                             SplitDirection::Vertical, &mut layout, &mut vterms,
                             &mut writers, &mut read_tasks, &split_tx, &screen,
-                            &mut renderer, &input, terminal_name, config,
+                            &mut renderer, &input, terminal_name, config, view_id,
                         ).await?;
                     }
                     Action::PaneNavigate(dir) => {
@@ -190,6 +199,9 @@ async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16, 
                         layout.resize_focused(dir, 0.05);
                         resize_all_vterms(&layout, &mut vterms, &mut writers, &screen).await?;
                         render_all_panes(&mut renderer, &layout, &mut vterms, &screen, &input, terminal_name, config)?;
+                        if let Some(vid) = view_id {
+                            sync_layout(vid, &layout).await;
+                        }
                     }
                     Action::PaneClose => {
                         if let Some(closed) = layout.close_focused() {
@@ -202,6 +214,15 @@ async fn run_tui(stream: UnixStream, terminal_name: &str, cols: u16, rows: u16, 
                             }
                             resize_all_vterms(&layout, &mut vterms, &mut writers, &screen).await?;
                             render_all_panes(&mut renderer, &layout, &mut vterms, &screen, &input, terminal_name, config)?;
+                            if let Some(vid) = view_id {
+                                if let Ok(mut c) = IpcClient::connect().await {
+                                    let _ = c.send(Request::ViewRemoveTerminal {
+                                        view_id: vid.to_string(),
+                                        terminal_id: closed,
+                                    }).await;
+                                }
+                                sync_layout(vid, &layout).await;
+                            }
                         }
                     }
                     Action::ViewList => {
@@ -332,6 +353,7 @@ async fn handle_split(
     input: &InputHandler,
     terminal_name: &str,
     config: &Config,
+    view_id: Option<&str>,
 ) -> Result<()> {
     // Check minimum size before splitting
     let focused_rect = layout
@@ -400,6 +422,17 @@ async fn handle_split(
 
     resize_all_vterms(layout, vterms, writers, screen).await?;
     render_all_panes(renderer, layout, vterms, screen, input, terminal_name, config)?;
+
+    if let Some(vid) = view_id {
+        if let Ok(mut c) = IpcClient::connect().await {
+            let _ = c.send(Request::ViewAddTerminal {
+                view_id: vid.to_string(),
+                terminal_id: new_id,
+            }).await;
+        }
+        sync_layout(vid, layout).await;
+    }
+
     Ok(())
 }
 
@@ -444,6 +477,18 @@ async fn handle_resize(
     resize_all_vterms(layout, vterms, writers, screen).await?;
     render_all_panes(renderer, layout, vterms, screen, input, terminal_name, config)?;
     Ok(())
+}
+
+async fn sync_layout(view_id: &str, layout: &PaneLayout) {
+    if let Ok(mut c) = IpcClient::connect().await {
+        let _ = c
+            .send(Request::ViewUpdateLayout {
+                view_id: view_id.to_string(),
+                layout: layout.to_value(),
+                focused: layout.focused_terminal().to_string(),
+            })
+            .await;
+    }
 }
 
 async fn fetch_view_list_text() -> Result<String> {

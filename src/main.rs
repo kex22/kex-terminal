@@ -279,7 +279,7 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
             ViewAction::Attach { id } => {
                 let mut client = IpcClient::connect().await?;
                 match client.send(Request::ViewAttach { id: id.clone() }).await? {
-                    Response::ViewAttach { terminal_ids } => {
+                    Response::ViewAttach { terminal_ids, layout, focused } => {
                         if terminal_ids.is_empty() {
                             return Err(KexError::Server("view has no terminals".into()));
                         }
@@ -296,6 +296,9 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                                     client.into_stream(),
                                     &label,
                                     &terminal_ids[1..],
+                                    Some(&id),
+                                    layout,
+                                    focused,
                                 )
                                 .await
                             }

@@ -1,13 +1,15 @@
+use serde::{Deserialize, Serialize};
+
 use super::input::Direction;
 use super::screen::Rect;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitDirection {
     Horizontal,
     Vertical,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) enum LayoutNode {
     Leaf {
         terminal_id: String,
@@ -31,6 +33,24 @@ impl PaneLayout {
         Self {
             root: LayoutNode::Leaf { terminal_id },
             focused,
+        }
+    }
+
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(&self.root).unwrap_or_default()
+    }
+
+    pub fn from_value(v: serde_json::Value, focused: Option<&str>, fallback_terminal: &str) -> Self {
+        let root: LayoutNode = serde_json::from_value(v)
+            .unwrap_or(LayoutNode::Leaf { terminal_id: fallback_terminal.to_string() });
+        let focused = focused.unwrap_or_else(|| Self::first_leaf(&root)).to_string();
+        Self { root, focused }
+    }
+
+    fn first_leaf(node: &LayoutNode) -> &str {
+        match node {
+            LayoutNode::Leaf { terminal_id } => terminal_id,
+            LayoutNode::Split { first, .. } => Self::first_leaf(first),
         }
     }
 
@@ -468,5 +488,34 @@ mod tests {
         assert_eq!(x, 0);
         assert_eq!(y, 11); // after top pane height
         assert_eq!(len, 80);
+    }
+
+    #[test]
+    fn layout_roundtrip_single_pane() {
+        let layout = PaneLayout::new("t1".into());
+        let v = layout.to_value();
+        let restored = PaneLayout::from_value(v, None, "fallback");
+        assert_eq!(restored.focused_terminal(), "t1");
+        let rects = restored.compute_rects(area());
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].0, "t1");
+    }
+
+    #[test]
+    fn layout_roundtrip_nested_split() {
+        let mut layout = PaneLayout::new("t1".into());
+        layout.split(SplitDirection::Vertical, "t2".into());
+        layout.split(SplitDirection::Horizontal, "t3".into());
+        let v = layout.to_value();
+        let restored = PaneLayout::from_value(v, Some("t2"), "fallback");
+        assert_eq!(restored.focused_terminal(), "t2");
+        let rects = restored.compute_rects(area());
+        assert_eq!(rects.len(), 3);
+    }
+
+    #[test]
+    fn layout_from_invalid_value_uses_fallback() {
+        let restored = PaneLayout::from_value(serde_json::json!("garbage"), None, "fb");
+        assert_eq!(restored.focused_terminal(), "fb");
     }
 }
