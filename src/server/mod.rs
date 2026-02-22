@@ -271,6 +271,11 @@ async fn handle_connection(
             vmgr.remove_terminal_from_view(&view_id, &terminal_id);
             Response::Ok
         }
+        Request::MultiplexAttach { .. }
+        | Request::TerminalSync { .. }
+        | Request::TerminalUnsync { .. } => Response::Error {
+            message: "not yet implemented".into(),
+        },
     };
     let result = write_message(&mut stream, &resp).await;
     if is_mutation {
@@ -352,7 +357,7 @@ async fn handle_attach(
                 Ok((_, BinaryFrame::Resize { cols, rows })) => {
                     let _ = pty_resizer.resize(cols, rows);
                 }
-                Ok((_, BinaryFrame::Detach)) | Err(_) => break,
+                Ok((_, BinaryFrame::Detach | BinaryFrame::Control(_))) | Err(_) => break,
             }
         }
     });
