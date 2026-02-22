@@ -14,7 +14,7 @@ struct DeviceCodeResponse {
 
 #[derive(Deserialize)]
 struct TokenResponse {
-    token: String,
+    access_token: String,
 }
 
 #[derive(Deserialize)]
@@ -27,7 +27,7 @@ pub async fn login(server_url: &str) -> Result<()> {
 
     // Request device code
     let res: DeviceCodeResponse = client
-        .post(format!("{server_url}/api/auth/device-authorization/code"))
+        .post(format!("{server_url}/api/auth/device/code"))
         .json(&serde_json::json!({ "client_id": CLIENT_ID }))
         .send()
         .await
@@ -42,12 +42,13 @@ pub async fn login(server_url: &str) -> Result<()> {
     let _ = open::that(&res.verification_uri);
 
     // Poll for token
-    let interval = std::time::Duration::from_secs(res.interval);
+    let mut interval = std::time::Duration::from_secs(res.interval);
     let token = loop {
         tokio::time::sleep(interval).await;
         let poll = client
-            .post(format!("{server_url}/api/auth/device-authorization/token"))
+            .post(format!("{server_url}/api/auth/device/token"))
             .json(&serde_json::json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 "device_code": res.device_code,
                 "client_id": CLIENT_ID,
             }))
@@ -60,7 +61,7 @@ pub async fn login(server_url: &str) -> Result<()> {
                 .json()
                 .await
                 .map_err(|e| KexError::Server(format!("invalid token response: {e}")))?;
-            break t.token;
+            break t.access_token;
         }
         let err: ErrorResponse = poll.json().await.unwrap_or(ErrorResponse { error: None });
         match err.error.as_deref() {
@@ -72,6 +73,7 @@ pub async fn login(server_url: &str) -> Result<()> {
             Some("access_denied") => {
                 return Err(KexError::Server("authorization denied".into()));
             }
+            Some("slow_down") => interval += std::time::Duration::from_secs(5),
             _ => {} // authorization_pending — keep polling
         }
     };
