@@ -596,7 +596,9 @@ async fn handle_mux_request(
                 pty_resizers.insert(id.clone(), t.pty.clone_resizer());
                 drop(mgr);
                 let handle = spawn_pty_reader(id.clone(), reader, tx.clone());
-                readers.lock().await.insert(id.clone(), handle);
+                if let Some(old) = readers.lock().await.insert(id.clone(), handle) {
+                    old.abort();
+                }
                 persister.notify();
                 MuxResponse::TerminalCreated { id }
             } else {
@@ -624,7 +626,9 @@ async fn handle_mux_request(
             pty_resizers.insert(id.clone(), t.pty.clone_resizer());
             drop(mgr);
             let handle = spawn_pty_reader(id.clone(), reader, tx.clone());
-            readers.lock().await.insert(id.clone(), handle);
+            if let Some(old) = readers.lock().await.insert(id.clone(), handle) {
+                old.abort();
+            }
             MuxResponse::Ok
         }
         MuxRequest::RemoveTerminal { id } => {
@@ -902,6 +906,116 @@ mod tests {
 
         // Clean up
         write_binary_frame(&mut client_write, &t1, &BinaryFrame::Detach)
+            .await
+            .unwrap();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn multiplex_control_kill_terminal() {
+        let (client, server) = paired_streams().await;
+        let (mgr, vmgr, persister) = test_managers();
+
+        let t1 = mgr.lock().await.create(None).unwrap();
+        let t2 = mgr.lock().await.create(None).unwrap();
+
+        let handle = tokio::spawn(handle_multiplex_attach(
+            server,
+            mgr.clone(),
+            vmgr,
+            persister,
+            vec![t1.clone(), t2.clone()],
+            None,
+        ));
+
+        let (mut client_read, mut client_write) = client.into_split();
+        let _resp: Response = read_message(&mut client_read).await.unwrap();
+
+        // Kill t2
+        let req = MuxRequest::KillTerminal { id: t2.clone() };
+        let payload = serde_json::to_vec(&req).unwrap();
+        write_binary_frame(
+            &mut client_write,
+            "\0\0\0\0\0\0\0\0",
+            &BinaryFrame::Control(payload),
+        )
+        .await
+        .unwrap();
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let (_, frame) = read_binary_frame(&mut client_read).await.unwrap();
+                if let BinaryFrame::Control(payload) = frame {
+                    return serde_json::from_slice::<MuxResponse>(&payload).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("should receive control response");
+
+        assert!(matches!(resp, MuxResponse::Ok));
+        // Terminal should be gone from manager
+        assert!(mgr.lock().await.get(&t2).is_none());
+
+        write_binary_frame(&mut client_write, &t1, &BinaryFrame::Detach)
+            .await
+            .unwrap();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn multiplex_control_update_layout() {
+        let (client, server) = paired_streams().await;
+        let (mgr, vmgr, persister) = test_managers();
+
+        let tid = mgr.lock().await.create(None).unwrap();
+        let view_id = vmgr.lock().await.create(None, tid.clone());
+
+        let handle = tokio::spawn(handle_multiplex_attach(
+            server,
+            mgr,
+            vmgr.clone(),
+            persister,
+            vec![tid.clone()],
+            None,
+        ));
+
+        let (mut client_read, mut client_write) = client.into_split();
+        let _resp: Response = read_message(&mut client_read).await.unwrap();
+
+        let req = MuxRequest::UpdateLayout {
+            view_id: view_id.clone(),
+            layout: serde_json::json!({"type": "leaf", "terminal_id": &tid}),
+            focused: tid.clone(),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        write_binary_frame(
+            &mut client_write,
+            "\0\0\0\0\0\0\0\0",
+            &BinaryFrame::Control(payload),
+        )
+        .await
+        .unwrap();
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let (_, frame) = read_binary_frame(&mut client_read).await.unwrap();
+                if let BinaryFrame::Control(payload) = frame {
+                    return serde_json::from_slice::<MuxResponse>(&payload).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("should receive control response");
+
+        assert!(matches!(resp, MuxResponse::Ok));
+        // Verify layout was persisted
+        let v = vmgr.lock().await;
+        let view = v.get(&view_id).unwrap();
+        assert_eq!(view.focused, tid);
+
+        drop(v);
+        write_binary_frame(&mut client_write, &tid, &BinaryFrame::Detach)
             .await
             .unwrap();
         let _ = handle.await;
