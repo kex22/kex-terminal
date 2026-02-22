@@ -1,5 +1,4 @@
 use serde::{Serialize, de::DeserializeOwned};
-use serde_json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{KexError, Result};

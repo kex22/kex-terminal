@@ -5,7 +5,7 @@
   "required": ["v", "type", "payload"],
   "properties": {
     "v": { "type": "integer", "const": 1 },
-    "type": { "type": "string", "pattern": "^[a-z]+\\.[a-z.]+$|^auth$|^error$" },
+    "type": { "type": "string", "pattern": "^[a-z][a-z.]*$" },
     "payload": { "type": "object" }
   },
   "additionalProperties": false
