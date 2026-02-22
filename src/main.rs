@@ -29,6 +29,14 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Login to kex cloud
+    Login {
+        /// Server URL
+        #[arg(long, default_value = "https://app.kex.dev")]
+        server: String,
+    },
+    /// Logout from kex cloud
+    Logout,
 }
 
 #[derive(Subcommand)]
@@ -341,5 +349,7 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                 Ok(())
             }
         },
+        Command::Login { server } => kex::cloud::login::login(&server).await,
+        Command::Logout => kex::cloud::login::logout().await,
     }
 }
