@@ -1,0 +1,6 @@
+[
+  { "v": 1, "type": "terminal.sync", "payload": { "terminalId": "t1a2b3c4", "name": "dev" } },
+  { "v": 1, "type": "terminal.unsync", "payload": { "terminalId": "t1a2b3c4" } },
+  { "v": 1, "type": "terminal.update", "payload": { "terminalId": "t1a2b3c4", "name": "prod" } },
+  { "v": 1, "type": "terminal.sync.ok", "payload": { "terminalId": "t1a2b3c4" } }
+]

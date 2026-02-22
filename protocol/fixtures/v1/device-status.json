@@ -1,0 +1,12 @@
+[
+  {
+    "v": 1,
+    "type": "device.status",
+    "payload": {
+      "syncedTerminals": [
+        { "id": "t1a2b3c4", "name": "dev" },
+        { "id": "t5e6f7g8" }
+      ]
+    }
+  }
+]

@@ -25,3 +25,4 @@ machine-uid = "0.5"
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
+jsonschema = "0.28"
