@@ -112,11 +112,23 @@ pub enum BinaryFrame {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MuxRequest {
-    CreateTerminal { name: Option<String> },
-    AddTerminal { id: String },
-    RemoveTerminal { id: String },
-    KillTerminal { id: String },
-    UpdateLayout { view_id: String, layout: Value, focused: String },
+    CreateTerminal {
+        name: Option<String>,
+    },
+    AddTerminal {
+        id: String,
+    },
+    RemoveTerminal {
+        id: String,
+    },
+    KillTerminal {
+        id: String,
+    },
+    UpdateLayout {
+        view_id: String,
+        layout: Value,
+        focused: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

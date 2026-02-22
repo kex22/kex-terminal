@@ -22,22 +22,31 @@ fn validate_fixture_envelope(fixture: &Value) {
     assert!(fixture.is_array(), "fixture must be an array");
     for (i, msg) in fixture.as_array().unwrap().iter().enumerate() {
         let result = validator.validate(msg);
-        assert!(result.is_ok(), "fixture[{i}] failed envelope validation: {:?}",
-            result.err().map(|e| e.to_string()));
+        assert!(
+            result.is_ok(),
+            "fixture[{i}] failed envelope validation: {:?}",
+            result.err().map(|e| e.to_string())
+        );
     }
 }
 
 fn validate_fixture_payloads(fixture: &Value, schema: &Value) {
-    let defs = schema.get("definitions").expect("schema missing definitions");
+    let defs = schema
+        .get("definitions")
+        .expect("schema missing definitions");
     for (i, msg) in fixture.as_array().unwrap().iter().enumerate() {
         let msg_type = msg["type"].as_str().unwrap();
-        let payload_schema = defs.get(msg_type)
+        let payload_schema = defs
+            .get(msg_type)
             .unwrap_or_else(|| panic!("no definition for type '{msg_type}'"));
         let validator = jsonschema::validator_for(payload_schema)
             .unwrap_or_else(|e| panic!("invalid schema for '{msg_type}': {e}"));
         let result = validator.validate(&msg["payload"]);
-        assert!(result.is_ok(), "fixture[{i}] payload failed '{msg_type}' validation: {:?}",
-            result.err().map(|e| e.to_string()));
+        assert!(
+            result.is_ok(),
+            "fixture[{i}] payload failed '{msg_type}' validation: {:?}",
+            result.err().map(|e| e.to_string())
+        );
     }
 }
 

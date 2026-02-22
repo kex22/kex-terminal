@@ -149,7 +149,9 @@ pub async fn read_control_frame<T: DeserializeOwned>(
     let (_, frame) = read_binary_frame(stream).await?;
     match frame {
         BinaryFrame::Control(payload) => Ok(serde_json::from_slice(&payload)?),
-        other => Err(KexError::Ipc(format!("expected Control frame, got {other:?}"))),
+        other => Err(KexError::Ipc(format!(
+            "expected Control frame, got {other:?}"
+        ))),
     }
 }
 
@@ -305,7 +307,9 @@ mod tests {
     #[tokio::test]
     async fn control_frame_mux_request_roundtrip() {
         let (mut client, mut server) = paired_streams().await;
-        let req = MuxRequest::CreateTerminal { name: Some("dev".into()) };
+        let req = MuxRequest::CreateTerminal {
+            name: Some("dev".into()),
+        };
         write_control_frame(&mut client, &req).await.unwrap();
         let decoded: MuxRequest = read_control_frame(&mut server).await.unwrap();
         assert!(matches!(decoded, MuxRequest::CreateTerminal { name: Some(n) } if n == "dev"));
@@ -340,6 +344,8 @@ mod tests {
         };
         write_message(&mut client, &req).await.unwrap();
         let decoded: Request = read_message(&mut server).await.unwrap();
-        assert!(matches!(decoded, Request::MultiplexAttach { terminal_ids, view_id: Some(v) } if terminal_ids.len() == 2 && v == "v1"));
+        assert!(
+            matches!(decoded, Request::MultiplexAttach { terminal_ids, view_id: Some(v) } if terminal_ids.len() == 2 && v == "v1")
+        );
     }
 }
