@@ -59,7 +59,9 @@ kex-terminal 是一个现代化的终端多路复用器（类 tmux），采用 R
 ```
 kex-terminal/
 ├── src/
+│   ├── cloud/            ← Cloud 命令（login/logout, Device Auth Grant）
 │   ├── config.rs          ← 配置文件加载（TOML、prefix key、UI 偏好）
+│   ├── credential.rs      ← Token 持久化（XDG 路径、chmod 0600）
 │   ├── ipc/              ← IPC 通信（Unix socket、消息编解码）
 │   ├── server/           ← Server 守护进程（daemon、PID 管理、状态持久化）
 │   ├── terminal/         ← 终端管理（PTY、attach、生命周期）
