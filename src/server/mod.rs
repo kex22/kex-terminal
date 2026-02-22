@@ -2,17 +2,20 @@ pub mod daemon;
 pub mod pid;
 pub mod state;
 
-use std::io::Write as _;
+use std::collections::HashMap;
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 
 use crate::error::{KexError, Result};
 use crate::ipc;
 use crate::ipc::codec::{read_binary_frame, read_message, write_binary_frame, write_message};
-use crate::ipc::message::{BinaryFrame, Request, Response, ViewInfo};
+use crate::ipc::message::{BinaryFrame, MuxRequest, MuxResponse, Request, Response, ViewInfo};
 use crate::server::state::StatePersister;
 use crate::terminal::manager::TerminalManager;
+use crate::terminal::pty::PtyResizer;
 use crate::view::manager::ViewManager;
 
 pub struct Server {
@@ -271,9 +274,21 @@ async fn handle_connection(
             vmgr.remove_terminal_from_view(&view_id, &terminal_id);
             Response::Ok
         }
-        Request::MultiplexAttach { .. }
-        | Request::TerminalSync { .. }
-        | Request::TerminalUnsync { .. } => Response::Error {
+        Request::MultiplexAttach {
+            terminal_ids,
+            view_id,
+        } => {
+            return handle_multiplex_attach(
+                stream,
+                manager,
+                view_manager,
+                persister,
+                terminal_ids,
+                view_id,
+            )
+            .await;
+        }
+        Request::TerminalSync { .. } | Request::TerminalUnsync { .. } => Response::Error {
             message: "not yet implemented".into(),
         },
     };
@@ -370,4 +385,525 @@ async fn handle_attach(
     }
 
     Ok(())
+}
+
+/// Spawn a blocking pty_read task that sends data frames into the shared channel.
+fn spawn_pty_reader(
+    terminal_id: String,
+    mut pty_reader: Box<dyn std::io::Read + Send>,
+    tx: tokio::sync::mpsc::Sender<(String, BinaryFrame)>,
+) -> JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match pty_reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let frame = BinaryFrame::Data(buf[..n].to_vec());
+                    if tx.blocking_send((terminal_id.clone(), frame)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn handle_multiplex_attach(
+    mut stream: UnixStream,
+    manager: Arc<Mutex<TerminalManager>>,
+    view_manager: Arc<Mutex<ViewManager>>,
+    persister: StatePersister,
+    terminal_ids: Vec<String>,
+    _view_id: Option<String>,
+) -> Result<()> {
+    // Validate terminals and collect PTY handles
+    let mut pty_writers: HashMap<String, Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>> =
+        HashMap::new();
+    let mut pty_resizers: HashMap<String, PtyResizer> = HashMap::new();
+    let mut valid_ids = Vec::new();
+
+    {
+        let mgr = manager.lock().await;
+        for id in &terminal_ids {
+            if let Some(t) = mgr.get(id)
+                && let Ok(reader) = t.pty.clone_reader()
+            {
+                pty_writers.insert(id.clone(), t.pty.clone_writer());
+                pty_resizers.insert(id.clone(), t.pty.clone_resizer());
+                valid_ids.push((id.clone(), reader));
+            }
+        }
+    }
+
+    let attached_ids: Vec<String> = valid_ids.iter().map(|(id, _)| id.clone()).collect();
+    write_message(
+        &mut stream,
+        &Response::MultiplexAttached {
+            terminal_ids: attached_ids,
+        },
+    )
+    .await?;
+
+    if valid_ids.is_empty() {
+        return Ok(());
+    }
+
+    let (sock_read, mut sock_write) = stream.into_split();
+
+    // Shared channel: pty_read tasks send Data frames, sock_read sends Control responses
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, BinaryFrame)>(64);
+
+    // Spawn pty_read tasks, track by terminal_id
+    let readers = Arc::new(Mutex::new(HashMap::<String, JoinHandle<()>>::new()));
+    for (id, pty_reader) in valid_ids {
+        let handle = spawn_pty_reader(id.clone(), pty_reader, tx.clone());
+        readers.lock().await.insert(id, handle);
+    }
+
+    // Keep one tx clone for sock_read task (to spawn new readers + send control responses).
+    // Drop the original so channel closes when sock_read + all readers finish.
+    let tx_for_sock_read = tx.clone();
+    drop(tx);
+
+    // sock_write task: drain channel, write binary frames to socket
+    let sock_write_task = tokio::spawn(async move {
+        while let Some((tid, frame)) = rx.recv().await {
+            if write_binary_frame(&mut sock_write, &tid, &frame)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // sock_read task: route frames by terminal_id, handle Control frames
+    let sock_read_task = tokio::spawn(mux_sock_read(
+        sock_read,
+        pty_writers,
+        pty_resizers,
+        readers.clone(),
+        tx_for_sock_read,
+        manager,
+        view_manager,
+        persister,
+    ));
+
+    tokio::select! {
+        _ = sock_write_task => {}
+        _ = sock_read_task => {}
+    }
+
+    // Abort remaining reader tasks on disconnect
+    for (_, handle) in readers.lock().await.drain() {
+        handle.abort();
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mux_sock_read(
+    mut sock_read: tokio::net::unix::OwnedReadHalf,
+    mut pty_writers: HashMap<String, Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
+    mut pty_resizers: HashMap<String, PtyResizer>,
+    readers: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    tx: tokio::sync::mpsc::Sender<(String, BinaryFrame)>,
+    manager: Arc<Mutex<TerminalManager>>,
+    view_manager: Arc<Mutex<ViewManager>>,
+    persister: StatePersister,
+) {
+    loop {
+        match read_binary_frame(&mut sock_read).await {
+            Ok((tid, BinaryFrame::Data(data))) => {
+                if let Some(w) = pty_writers.get(&tid) {
+                    let Ok(mut w) = w.lock() else { continue };
+                    let _ = w.write_all(&data);
+                }
+            }
+            Ok((tid, BinaryFrame::Resize { cols, rows })) => {
+                if let Some(r) = pty_resizers.get(&tid) {
+                    let _ = r.resize(cols, rows);
+                }
+            }
+            Ok((_, BinaryFrame::Control(payload))) => {
+                let req: MuxRequest = match serde_json::from_slice(&payload) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let resp = handle_mux_request(
+                    req,
+                    &mut pty_writers,
+                    &mut pty_resizers,
+                    &readers,
+                    &tx,
+                    &manager,
+                    &view_manager,
+                    &persister,
+                )
+                .await;
+                // Send control response through the shared channel to sock_write task
+                let resp_payload = match serde_json::to_vec(&resp) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let _ = tx
+                    .send((
+                        "\0\0\0\0\0\0\0\0".into(),
+                        BinaryFrame::Control(resp_payload),
+                    ))
+                    .await;
+            }
+            Ok((_, BinaryFrame::Detach)) | Err(_) => break,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_mux_request(
+    req: MuxRequest,
+    pty_writers: &mut HashMap<String, Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
+    pty_resizers: &mut HashMap<String, PtyResizer>,
+    readers: &Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    tx: &tokio::sync::mpsc::Sender<(String, BinaryFrame)>,
+    manager: &Arc<Mutex<TerminalManager>>,
+    view_manager: &Arc<Mutex<ViewManager>>,
+    persister: &StatePersister,
+) -> MuxResponse {
+    match req {
+        MuxRequest::CreateTerminal { name } => {
+            let mut mgr = manager.lock().await;
+            let id = match mgr.create(name) {
+                Ok(id) => id,
+                Err(e) => {
+                    return MuxResponse::Error {
+                        message: e.to_string(),
+                    };
+                }
+            };
+            // Wire up the new terminal's PTY
+            if let Some(t) = mgr.get(&id) {
+                let reader = match t.pty.clone_reader() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return MuxResponse::Error {
+                            message: e.to_string(),
+                        };
+                    }
+                };
+                pty_writers.insert(id.clone(), t.pty.clone_writer());
+                pty_resizers.insert(id.clone(), t.pty.clone_resizer());
+                drop(mgr);
+                let handle = spawn_pty_reader(id.clone(), reader, tx.clone());
+                readers.lock().await.insert(id.clone(), handle);
+                persister.notify();
+                MuxResponse::TerminalCreated { id }
+            } else {
+                MuxResponse::Error {
+                    message: "terminal vanished after create".into(),
+                }
+            }
+        }
+        MuxRequest::AddTerminal { id } => {
+            let mgr = manager.lock().await;
+            let Some(t) = mgr.get(&id) else {
+                return MuxResponse::Error {
+                    message: format!("terminal not found: {id}"),
+                };
+            };
+            let reader = match t.pty.clone_reader() {
+                Ok(r) => r,
+                Err(e) => {
+                    return MuxResponse::Error {
+                        message: e.to_string(),
+                    };
+                }
+            };
+            pty_writers.insert(id.clone(), t.pty.clone_writer());
+            pty_resizers.insert(id.clone(), t.pty.clone_resizer());
+            drop(mgr);
+            let handle = spawn_pty_reader(id.clone(), reader, tx.clone());
+            readers.lock().await.insert(id.clone(), handle);
+            MuxResponse::Ok
+        }
+        MuxRequest::RemoveTerminal { id } => {
+            pty_writers.remove(&id);
+            pty_resizers.remove(&id);
+            if let Some(handle) = readers.lock().await.remove(&id) {
+                handle.abort();
+            }
+            MuxResponse::Ok
+        }
+        MuxRequest::KillTerminal { id } => {
+            // Remove from mux first
+            pty_writers.remove(&id);
+            pty_resizers.remove(&id);
+            if let Some(handle) = readers.lock().await.remove(&id) {
+                handle.abort();
+            }
+            // Kill the terminal process
+            let mut mgr = manager.lock().await;
+            if let Err(e) = mgr.kill(&id) {
+                return MuxResponse::Error {
+                    message: e.to_string(),
+                };
+            }
+            drop(mgr);
+            let mut vmgr = view_manager.lock().await;
+            vmgr.remove_terminal(&id);
+            drop(vmgr);
+            persister.notify();
+            MuxResponse::Ok
+        }
+        MuxRequest::UpdateLayout {
+            view_id,
+            layout,
+            focused,
+        } => {
+            let mut vmgr = view_manager.lock().await;
+            vmgr.update_layout(&view_id, layout, focused);
+            drop(vmgr);
+            persister.notify();
+            MuxResponse::Ok
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixStream;
+
+    async fn paired_streams() -> (UnixStream, UnixStream) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let client = UnixStream::connect(&sock).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    fn test_managers() -> (
+        Arc<Mutex<TerminalManager>>,
+        Arc<Mutex<ViewManager>>,
+        StatePersister,
+    ) {
+        let mgr = Arc::new(Mutex::new(TerminalManager::new()));
+        let vmgr = Arc::new(Mutex::new(ViewManager::new()));
+        let persister = StatePersister::spawn(mgr.clone(), vmgr.clone());
+        (mgr, vmgr, persister)
+    }
+
+    #[tokio::test]
+    async fn multiplex_attach_filters_invalid_terminals() {
+        let (client, server) = paired_streams().await;
+        let (mgr, vmgr, persister) = test_managers();
+
+        // Create one real terminal
+        let real_id = mgr.lock().await.create(None).unwrap();
+
+        let handle = tokio::spawn(handle_multiplex_attach(
+            server,
+            mgr,
+            vmgr,
+            persister,
+            vec![real_id.clone(), "nonexist".into()],
+            None,
+        ));
+
+        let (mut client_read, mut client_write) = client.into_split();
+        let resp: Response = read_message(&mut client_read).await.unwrap();
+
+        // Should only contain the valid terminal
+        match resp {
+            Response::MultiplexAttached { terminal_ids } => {
+                assert_eq!(terminal_ids, vec![real_id.clone()]);
+            }
+            other => panic!("expected MultiplexAttached, got {other:?}"),
+        }
+
+        // Send Detach to cleanly close
+        write_binary_frame(&mut client_write, &real_id, &BinaryFrame::Detach)
+            .await
+            .unwrap();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn multiplex_attach_empty_returns_immediately() {
+        let (client, server) = paired_streams().await;
+        let (mgr, vmgr, persister) = test_managers();
+
+        let handle = tokio::spawn(handle_multiplex_attach(
+            server,
+            mgr,
+            vmgr,
+            persister,
+            vec!["nonexist".into()],
+            None,
+        ));
+
+        let mut client_read = client;
+        let resp: Response = read_message(&mut client_read).await.unwrap();
+        match resp {
+            Response::MultiplexAttached { terminal_ids } => {
+                assert!(terminal_ids.is_empty());
+            }
+            other => panic!("expected MultiplexAttached, got {other:?}"),
+        }
+
+        // Server should return immediately since no valid terminals
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiplex_attach_receives_pty_output() {
+        let (client, server) = paired_streams().await;
+        let (mgr, vmgr, persister) = test_managers();
+
+        let tid = mgr.lock().await.create(None).unwrap();
+
+        let handle = tokio::spawn(handle_multiplex_attach(
+            server,
+            mgr.clone(),
+            vmgr,
+            persister,
+            vec![tid.clone()],
+            None,
+        ));
+
+        let (mut client_read, mut client_write) = client.into_split();
+        let _resp: Response = read_message(&mut client_read).await.unwrap();
+
+        // The shell should produce some output (prompt, etc.)
+        // Read at least one data frame within a timeout
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            read_binary_frame(&mut client_read),
+        )
+        .await;
+
+        assert!(result.is_ok(), "should receive PTY output");
+        let (frame_tid, frame) = result.unwrap().unwrap();
+        assert_eq!(frame_tid, tid);
+        assert!(matches!(frame, BinaryFrame::Data(_)));
+
+        // Clean up
+        write_binary_frame(&mut client_write, &tid, &BinaryFrame::Detach)
+            .await
+            .unwrap();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn multiplex_control_create_terminal() {
+        let (client, server) = paired_streams().await;
+        let (mgr, vmgr, persister) = test_managers();
+
+        let tid = mgr.lock().await.create(None).unwrap();
+
+        let handle = tokio::spawn(handle_multiplex_attach(
+            server,
+            mgr.clone(),
+            vmgr,
+            persister,
+            vec![tid.clone()],
+            None,
+        ));
+
+        let (mut client_read, mut client_write) = client.into_split();
+        let _resp: Response = read_message(&mut client_read).await.unwrap();
+
+        // Send CreateTerminal control frame
+        let req = MuxRequest::CreateTerminal {
+            name: Some("new-term".into()),
+        };
+        let payload = serde_json::to_vec(&req).unwrap();
+        write_binary_frame(
+            &mut client_write,
+            "\0\0\0\0\0\0\0\0",
+            &BinaryFrame::Control(payload),
+        )
+        .await
+        .unwrap();
+
+        // Read frames until we get a Control response (skip Data frames from PTY)
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let (_, frame) = read_binary_frame(&mut client_read).await.unwrap();
+                if let BinaryFrame::Control(payload) = frame {
+                    return serde_json::from_slice::<MuxResponse>(&payload).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("should receive control response");
+
+        match resp {
+            MuxResponse::TerminalCreated { id } => {
+                // Verify the terminal actually exists in the manager
+                assert!(mgr.lock().await.get(&id).is_some());
+            }
+            other => panic!("expected TerminalCreated, got {other:?}"),
+        }
+
+        // Clean up
+        write_binary_frame(&mut client_write, &tid, &BinaryFrame::Detach)
+            .await
+            .unwrap();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn multiplex_control_remove_terminal() {
+        let (client, server) = paired_streams().await;
+        let (mgr, vmgr, persister) = test_managers();
+
+        let t1 = mgr.lock().await.create(None).unwrap();
+        let t2 = mgr.lock().await.create(None).unwrap();
+
+        let handle = tokio::spawn(handle_multiplex_attach(
+            server,
+            mgr,
+            vmgr,
+            persister,
+            vec![t1.clone(), t2.clone()],
+            None,
+        ));
+
+        let (mut client_read, mut client_write) = client.into_split();
+        let _resp: Response = read_message(&mut client_read).await.unwrap();
+
+        // Remove t2 from the mux
+        let req = MuxRequest::RemoveTerminal { id: t2.clone() };
+        let payload = serde_json::to_vec(&req).unwrap();
+        write_binary_frame(
+            &mut client_write,
+            "\0\0\0\0\0\0\0\0",
+            &BinaryFrame::Control(payload),
+        )
+        .await
+        .unwrap();
+
+        // Read until we get the Control response
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let (_, frame) = read_binary_frame(&mut client_read).await.unwrap();
+                if let BinaryFrame::Control(payload) = frame {
+                    return serde_json::from_slice::<MuxResponse>(&payload).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("should receive control response");
+
+        assert!(matches!(resp, MuxResponse::Ok));
+
+        // Clean up
+        write_binary_frame(&mut client_write, &t1, &BinaryFrame::Detach)
+            .await
+            .unwrap();
+        let _ = handle.await;
+    }
 }
