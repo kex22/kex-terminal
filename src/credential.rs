@@ -22,7 +22,8 @@ pub fn load() -> Result<Credential> {
     let path = credential_path();
     let content = std::fs::read_to_string(&path)
         .map_err(|_| KexError::Config("not logged in — run `kex login`".into()))?;
-    serde_json::from_str(&content).map_err(|e| KexError::Config(format!("invalid credentials: {e}")))
+    serde_json::from_str(&content)
+        .map_err(|e| KexError::Config(format!("invalid credentials: {e}")))
 }
 
 pub fn save(cred: &Credential) -> Result<()> {
