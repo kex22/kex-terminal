@@ -40,11 +40,13 @@ pub struct CloudManager {
     terminals: HashMap<String, SyncedTerminal>,
     conn: Option<WsStream>,
     backoff: Duration,
+    disconnect_at: Option<tokio::time::Instant>,
 }
 
 const HEARTBEAT_SECS: u64 = 30;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const RESP_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCONNECT_DELAY: Duration = Duration::from_secs(30);
 
 impl CloudManager {
     pub fn spawn(synced: SyncedSet) -> mpsc::Sender<CloudCommand> {
@@ -55,6 +57,7 @@ impl CloudManager {
             terminals: HashMap::new(),
             conn: None,
             backoff: Duration::from_secs(1),
+            disconnect_at: None,
         };
         tokio::spawn(mgr.run());
         tx
@@ -66,6 +69,7 @@ impl CloudManager {
 
         loop {
             let has_conn = self.conn.is_some();
+            let disconnect_at = self.disconnect_at;
             tokio::select! {
                 biased;
                 cmd = self.rx.recv() => {
@@ -73,6 +77,10 @@ impl CloudManager {
                         Some(cmd) => self.handle_cmd(cmd).await,
                         None => break,
                     }
+                }
+                _ = tokio::time::sleep_until(disconnect_at.unwrap_or(tokio::time::Instant::now())), if disconnect_at.is_some() && has_conn => {
+                    self.disconnect().await;
+                    self.disconnect_at = None;
                 }
                 _ = heartbeat.tick(), if has_conn => {
                     self.heartbeat().await;
@@ -96,6 +104,9 @@ impl CloudManager {
 
     async fn handle_sync(&mut self, id: String, name: Option<String>) -> Result<(), String> {
         let cred = credential::load().map_err(|e| e.to_string())?;
+
+        // Cancel pending delayed disconnect
+        self.disconnect_at = None;
 
         // Insert BEFORE sending so device.status includes this terminal
         self.terminals.insert(
@@ -136,9 +147,9 @@ impl CloudManager {
         self.terminals.remove(&id);
         self.synced.lock().await.remove(&id);
 
-        // Disconnect if no more synced terminals
+        // Schedule delayed disconnect if no more synced terminals
         if self.terminals.is_empty() {
-            self.disconnect().await;
+            self.disconnect_at = Some(tokio::time::Instant::now() + DISCONNECT_DELAY);
         }
 
         Ok(())
@@ -375,6 +386,7 @@ mod tests {
             terminals,
             conn: None,
             backoff: Duration::from_secs(1),
+            disconnect_at: None,
         };
 
         let msg = mgr.build_device_status();
