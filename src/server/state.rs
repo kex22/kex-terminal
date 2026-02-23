@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 
+use crate::cloud::manager::SyncedSet;
 use crate::ipc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -11,6 +13,8 @@ pub struct ServerState {
     pub terminals: Vec<TerminalMeta>,
     pub views: Vec<ViewMeta>,
     pub active_view: Option<String>,
+    #[serde(default)]
+    pub synced_terminals: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,18 +68,19 @@ impl StatePersister {
     pub fn spawn(
         manager: Arc<Mutex<crate::terminal::manager::TerminalManager>>,
         view_manager: Arc<Mutex<crate::view::manager::ViewManager>>,
+        synced: SyncedSet,
     ) -> Self {
         let trigger = Arc::new(Notify::new());
         let t = trigger.clone();
         tokio::spawn(async move {
             loop {
                 t.notified().await;
-                // Debounce: wait 500ms, consuming any additional notifications
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 let state = {
                     let mgr = manager.lock().await;
                     let vmgr = view_manager.lock().await;
-                    snapshot(&mgr, &vmgr)
+                    let s = synced.lock().await;
+                    snapshot(&mgr, &vmgr, &s)
                 };
                 state.save();
             }
@@ -91,6 +96,7 @@ impl StatePersister {
 fn snapshot(
     mgr: &crate::terminal::manager::TerminalManager,
     vmgr: &crate::view::manager::ViewManager,
+    synced: &HashSet<String>,
 ) -> ServerState {
     let terminals = mgr
         .list()
@@ -117,6 +123,7 @@ fn snapshot(
         terminals,
         views,
         active_view: None,
+        synced_terminals: synced.iter().cloned().collect(),
     }
 }
 
@@ -149,6 +156,7 @@ mod tests {
                 created_at: "2026-02-21 10:00".into(),
             }],
             active_view: Some("view0001".into()),
+            synced_terminals: vec!["abc12345".into()],
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: ServerState = serde_json::from_str(&json).unwrap();
@@ -156,6 +164,14 @@ mod tests {
         assert_eq!(restored.terminals[0].id, "abc12345");
         assert_eq!(restored.views.len(), 1);
         assert_eq!(restored.active_view, Some("view0001".into()));
+        assert_eq!(restored.synced_terminals, vec!["abc12345".to_string()]);
+    }
+
+    #[test]
+    fn deserialize_without_synced_terminals() {
+        let json = r#"{"terminals":[],"views":[],"active_view":null}"#;
+        let state: ServerState = serde_json::from_str(json).unwrap();
+        assert!(state.synced_terminals.is_empty());
     }
 
     #[test]

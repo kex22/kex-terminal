@@ -2,13 +2,14 @@ pub mod daemon;
 pub mod pid;
 pub mod state;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
+use crate::cloud::manager::{CloudCommand, CloudManager};
 use crate::error::{KexError, Result};
 use crate::ipc;
 use crate::ipc::codec::{read_binary_frame, read_message, write_binary_frame, write_message};
@@ -24,6 +25,7 @@ pub struct Server {
     manager: Arc<Mutex<TerminalManager>>,
     view_manager: Arc<Mutex<ViewManager>>,
     persister: StatePersister,
+    cloud_tx: tokio::sync::mpsc::Sender<CloudCommand>,
 }
 
 impl Server {
@@ -42,12 +44,21 @@ impl Server {
         let listener = UnixListener::bind(&sock_path)?;
         pid::write_pid()?;
 
+        // Restore synced terminals from previous run before cleaning stale state
+        let prev_synced: HashSet<String> = state::ServerState::load()
+            .synced_terminals
+            .into_iter()
+            .collect();
+
         // Clean stale state from previous run (PTYs are dead after restart)
         let _ = std::fs::remove_file(state::state_path());
 
         let manager = Arc::new(Mutex::new(TerminalManager::new()));
         let view_manager = Arc::new(Mutex::new(ViewManager::new()));
-        let persister = StatePersister::spawn(manager.clone(), view_manager.clone());
+        let synced = Arc::new(Mutex::new(prev_synced));
+        let persister =
+            StatePersister::spawn(manager.clone(), view_manager.clone(), synced.clone());
+        let cloud_tx = CloudManager::spawn(synced);
 
         let server = Server {
             listener,
@@ -55,6 +66,7 @@ impl Server {
             manager,
             view_manager,
             persister,
+            cloud_tx,
         };
         server.run().await
     }
@@ -91,8 +103,9 @@ impl Server {
                     let mgr = self.manager.clone();
                     let vmgr = self.view_manager.clone();
                     let persist = self.persister.clone();
+                    let cloud = self.cloud_tx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, notify, mgr, vmgr, persist).await {
+                        if let Err(e) = handle_connection(stream, notify, mgr, vmgr, persist, cloud).await {
                             eprintln!("connection error: {e}");
                         }
                     });
@@ -131,12 +144,15 @@ async fn handle_connection(
     manager: Arc<Mutex<TerminalManager>>,
     view_manager: Arc<Mutex<ViewManager>>,
     persister: StatePersister,
+    cloud_tx: tokio::sync::mpsc::Sender<CloudCommand>,
 ) -> Result<()> {
     let req: Request = read_message(&mut stream).await?;
     let is_mutation = matches!(
         req,
         Request::TerminalCreate { .. }
             | Request::TerminalKill { .. }
+            | Request::TerminalSync { .. }
+            | Request::TerminalUnsync { .. }
             | Request::ViewCreate { .. }
             | Request::ViewDelete { .. }
             | Request::ViewAddTerminal { .. }
@@ -288,9 +304,51 @@ async fn handle_connection(
             )
             .await;
         }
-        Request::TerminalSync { .. } | Request::TerminalUnsync { .. } => Response::Error {
-            message: "not yet implemented".into(),
-        },
+        Request::TerminalSync { id } => {
+            let mgr = manager.lock().await;
+            let Some(t) = mgr.get(&id) else {
+                return write_message(
+                    &mut stream,
+                    &Response::Error {
+                        message: format!("terminal not found: {id}"),
+                    },
+                )
+                .await;
+            };
+            let name = t.name.clone();
+            drop(mgr);
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+            let _ = cloud_tx
+                .send(CloudCommand::Sync {
+                    id,
+                    name,
+                    reply: reply_tx,
+                })
+                .await;
+            match reply_rx.recv().await {
+                Some(Ok(())) => Response::SyncStatus { synced: true },
+                Some(Err(e)) => Response::Error { message: e },
+                None => Response::Error {
+                    message: "cloud manager unavailable".into(),
+                },
+            }
+        }
+        Request::TerminalUnsync { id } => {
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+            let _ = cloud_tx
+                .send(CloudCommand::Unsync {
+                    id,
+                    reply: reply_tx,
+                })
+                .await;
+            match reply_rx.recv().await {
+                Some(Ok(())) => Response::SyncStatus { synced: false },
+                Some(Err(e)) => Response::Error { message: e },
+                None => Response::Error {
+                    message: "cloud manager unavailable".into(),
+                },
+            }
+        }
     };
     let result = write_message(&mut stream, &resp).await;
     if is_mutation {
@@ -695,7 +753,8 @@ mod tests {
     ) {
         let mgr = Arc::new(Mutex::new(TerminalManager::new()));
         let vmgr = Arc::new(Mutex::new(ViewManager::new()));
-        let persister = StatePersister::spawn(mgr.clone(), vmgr.clone());
+        let synced = Arc::new(Mutex::new(HashSet::new()));
+        let persister = StatePersister::spawn(mgr.clone(), vmgr.clone(), synced);
         (mgr, vmgr, persister)
     }
 
@@ -1018,6 +1077,63 @@ mod tests {
         write_binary_frame(&mut client_write, &tid, &BinaryFrame::Detach)
             .await
             .unwrap();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn sync_nonexistent_terminal_returns_error() {
+        let (mut client, server) = paired_streams().await;
+        let (mgr, vmgr, persister) = test_managers();
+        let synced = Arc::new(Mutex::new(HashSet::new()));
+        let cloud_tx = CloudManager::spawn(synced);
+
+        let handle = tokio::spawn(handle_connection(
+            server,
+            Arc::new(Notify::new()),
+            mgr,
+            vmgr,
+            persister,
+            cloud_tx,
+        ));
+
+        write_message(&mut client, &Request::TerminalSync { id: "nope".into() })
+            .await
+            .unwrap();
+        let resp: Response = read_message(&mut client).await.unwrap();
+        match resp {
+            Response::Error { message } => assert!(message.contains("not found")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn sync_without_credentials_returns_error() {
+        let (mut client, server) = paired_streams().await;
+        let (mgr, vmgr, persister) = test_managers();
+        let synced = Arc::new(Mutex::new(HashSet::new()));
+        let cloud_tx = CloudManager::spawn(synced.clone());
+
+        let tid = mgr.lock().await.create(None).unwrap();
+
+        let handle = tokio::spawn(handle_connection(
+            server,
+            Arc::new(Notify::new()),
+            mgr,
+            vmgr,
+            persister,
+            cloud_tx,
+        ));
+
+        write_message(&mut client, &Request::TerminalSync { id: tid })
+            .await
+            .unwrap();
+        let resp: Response = read_message(&mut client).await.unwrap();
+        match resp {
+            Response::Error { message } => assert!(message.contains("login")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(synced.lock().await.is_empty());
         let _ = handle.await;
     }
 }

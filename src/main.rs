@@ -70,6 +70,16 @@ enum TerminalAction {
         /// Terminal ID or name
         id: String,
     },
+    /// Sync a terminal to the cloud
+    Sync {
+        /// Terminal ID or name
+        id: String,
+    },
+    /// Unsync a terminal from the cloud
+    Unsync {
+        /// Terminal ID or name
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -206,6 +216,28 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                 }
             }
             TerminalAction::Attach { id } => kex::terminal::attach::attach(&id).await,
+            TerminalAction::Sync { id } => {
+                let mut client = IpcClient::connect().await?;
+                match client.send(Request::TerminalSync { id }).await? {
+                    Response::SyncStatus { synced: true } => {
+                        println!("terminal synced");
+                        Ok(())
+                    }
+                    Response::Error { message } => Err(KexError::Server(message)),
+                    _ => Ok(()),
+                }
+            }
+            TerminalAction::Unsync { id } => {
+                let mut client = IpcClient::connect().await?;
+                match client.send(Request::TerminalUnsync { id }).await? {
+                    Response::SyncStatus { synced: false } => {
+                        println!("terminal unsynced");
+                        Ok(())
+                    }
+                    Response::Error { message } => Err(KexError::Server(message)),
+                    _ => Ok(()),
+                }
+            }
         },
         Command::View { action } => match action {
             ViewAction::Create { name, terminal } => {
