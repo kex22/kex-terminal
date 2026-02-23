@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::error::Result;
 use crate::ipc::client::IpcClient;
-use crate::ipc::message::{BinaryFrame, MuxRequest, Request, Response, ViewInfo};
+use crate::ipc::message::{BinaryFrame, MuxRequest, MuxResponse, Request, Response, ViewInfo};
 use crate::ipc::mux::{LocalMuxSender, local_mux_connect};
 use crate::tui::input::{Action, InputHandler};
 use crate::tui::layout::{PaneLayout, SplitDirection};
@@ -209,7 +209,7 @@ impl TuiSession {
             .send_control(&MuxRequest::CreateTerminal { name: None })
             .await?
         {
-            crate::ipc::message::MuxResponse::TerminalCreated { id } => id,
+            MuxResponse::TerminalCreated { id } => id,
             _ => return Ok(()),
         };
 
@@ -218,7 +218,7 @@ impl TuiSession {
             .send_control(&MuxRequest::AddTerminal { id: new_id.clone() })
             .await?
         {
-            crate::ipc::message::MuxResponse::Ok => {}
+            MuxResponse::Ok => {}
             _ => {
                 let _ = self
                     .mux_tx
@@ -255,10 +255,9 @@ impl TuiSession {
     async fn handle_close(&mut self) -> Result<()> {
         if let Some(closed) = self.layout.close_focused() {
             self.vterms.remove(&closed);
-            let _ = self
-                .mux_tx
+            self.mux_tx
                 .send_control(&MuxRequest::RemoveTerminal { id: closed.clone() })
-                .await;
+                .await?;
             self.resize_all_vterms().await?;
             self.render_all()?;
 
@@ -313,11 +312,14 @@ impl TuiSession {
         let pane_area = self.screen.pane_area();
         for tid in terminal_ids {
             if !self.vterms.contains_key(tid) {
-                // Add terminal to mux connection
-                let _ = self
-                    .mux_tx
-                    .send_control(&MuxRequest::AddTerminal { id: tid.clone() })
-                    .await;
+                if !matches!(
+                    self.mux_tx
+                        .send_control(&MuxRequest::AddTerminal { id: tid.clone() })
+                        .await,
+                    Ok(MuxResponse::Ok)
+                ) {
+                    continue;
+                }
                 self.vterms.insert(
                     tid.clone(),
                     VirtualTerminal::new(pane_area.height, pane_area.width),

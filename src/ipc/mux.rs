@@ -54,7 +54,9 @@ impl<W: AsyncWrite + Unpin + Send> LocalMuxSender<W> {
             *slot = Some(tx);
         }
         write_control_frame(&mut self.writer, req).await?;
-        rx.await
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| KexError::Ipc("control response timed out".into()))?
             .map_err(|_| KexError::Ipc("control response channel closed".into()))
     }
 }
