@@ -59,25 +59,17 @@ pub async fn write_binary_frame(
     let copy_len = tid_bytes.len().min(8);
     biz_header[1..1 + copy_len].copy_from_slice(&tid_bytes[..copy_len]);
 
+    let resize_buf: [u8; 4];
     let payload_bytes: &[u8] = match frame {
         BinaryFrame::Data(data) => data,
         BinaryFrame::Control(payload) => payload,
-        _ => &[],
-    };
-
-    // Resize has a fixed 4-byte payload encoded inline
-    let resize_buf: [u8; 4];
-    let payload_bytes = match frame {
         BinaryFrame::Resize { cols, rows } => {
-            resize_buf = [
-                (cols >> 8) as u8,
-                *cols as u8,
-                (rows >> 8) as u8,
-                *rows as u8,
-            ];
-            &resize_buf[..]
+            let [ch, cl] = cols.to_be_bytes();
+            let [rh, rl] = rows.to_be_bytes();
+            resize_buf = [ch, cl, rh, rl];
+            &resize_buf
         }
-        _ => payload_bytes,
+        BinaryFrame::Detach => &[],
     };
 
     let total_len = (9 + payload_bytes.len()) as u32;
