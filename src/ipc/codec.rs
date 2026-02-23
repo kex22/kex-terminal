@@ -46,41 +46,44 @@ pub async fn write_binary_frame(
         BinaryFrame::Control(_) => FRAME_TYPE_CONTROL,
     };
 
-    // Header: [1B type][8B tid][4B len]
-    let mut header = [0u8; 13];
-    header[0] = type_byte;
+    // Business protocol: [1B type][8B tid][payload]
+    // Transport layer wraps with [4B len] prefix for TCP framing.
+    // On relay to WebSocket, strip the 4B len — inner bytes are identical.
+    let mut biz_header = [0u8; 9];
+    biz_header[0] = type_byte;
     let tid_bytes = terminal_id.as_bytes();
     debug_assert!(
         tid_bytes.len() <= 8,
         "terminal_id exceeds 8-byte frame field: {terminal_id}"
     );
     let copy_len = tid_bytes.len().min(8);
-    header[1..1 + copy_len].copy_from_slice(&tid_bytes[..copy_len]);
+    biz_header[1..1 + copy_len].copy_from_slice(&tid_bytes[..copy_len]);
 
-    match frame {
-        BinaryFrame::Data(data) => {
-            let len = (data.len() as u32).to_be_bytes();
-            header[9..13].copy_from_slice(&len);
-            stream.write_all(&header).await?;
-            stream.write_all(data).await?;
-        }
+    let payload_bytes: &[u8] = match frame {
+        BinaryFrame::Data(data) => data,
+        BinaryFrame::Control(payload) => payload,
+        _ => &[],
+    };
+
+    // Resize has a fixed 4-byte payload encoded inline
+    let resize_buf: [u8; 4];
+    let payload_bytes = match frame {
         BinaryFrame::Resize { cols, rows } => {
-            header[9..13].copy_from_slice(&4u32.to_be_bytes());
-            stream.write_all(&header).await?;
-            stream.write_all(&cols.to_be_bytes()).await?;
-            stream.write_all(&rows.to_be_bytes()).await?;
+            resize_buf = [
+                (cols >> 8) as u8,
+                *cols as u8,
+                (rows >> 8) as u8,
+                *rows as u8,
+            ];
+            &resize_buf[..]
         }
-        BinaryFrame::Detach => {
-            // len = 0
-            stream.write_all(&header).await?;
-        }
-        BinaryFrame::Control(payload) => {
-            let len = (payload.len() as u32).to_be_bytes();
-            header[9..13].copy_from_slice(&len);
-            stream.write_all(&header).await?;
-            stream.write_all(payload).await?;
-        }
-    }
+        _ => payload_bytes,
+    };
+
+    let total_len = (9 + payload_bytes.len()) as u32;
+    stream.write_all(&total_len.to_be_bytes()).await?;
+    stream.write_all(&biz_header).await?;
+    stream.write_all(payload_bytes).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -88,47 +91,45 @@ pub async fn write_binary_frame(
 pub async fn read_binary_frame(
     stream: &mut (impl AsyncRead + Unpin),
 ) -> Result<(String, BinaryFrame)> {
-    let mut header = [0u8; 13];
-    stream.read_exact(&mut header).await?;
+    // Transport layer: [4B len] then [len bytes of business protocol]
+    // Business protocol: [1B type][8B tid][payload]
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let total_len = u32::from_be_bytes(len_buf) as usize;
 
-    let type_byte = header[0];
-    let tid = std::str::from_utf8(&header[1..9])
+    if total_len < 9 {
+        return Err(KexError::Ipc(format!("frame too short: {total_len} bytes")));
+    }
+    if total_len > MAX_MESSAGE_SIZE {
+        return Err(KexError::Ipc(format!("frame too large: {total_len} bytes")));
+    }
+
+    let mut buf = vec![0u8; total_len];
+    stream.read_exact(&mut buf).await?;
+
+    let type_byte = buf[0];
+    let tid = std::str::from_utf8(&buf[1..9])
         .unwrap_or("")
         .trim_end_matches('\0')
         .to_string();
-    let payload_len = u32::from_be_bytes([header[9], header[10], header[11], header[12]]) as usize;
-
-    if payload_len > MAX_MESSAGE_SIZE {
-        return Err(KexError::Ipc(format!(
-            "frame too large: {payload_len} bytes"
-        )));
-    }
+    let payload = &buf[9..];
 
     let frame = match type_byte {
-        FRAME_TYPE_DATA => {
-            let mut buf = vec![0u8; payload_len];
-            stream.read_exact(&mut buf).await?;
-            BinaryFrame::Data(buf)
-        }
+        FRAME_TYPE_DATA => BinaryFrame::Data(payload.to_vec()),
         FRAME_TYPE_RESIZE => {
-            if payload_len != 4 {
+            if payload.len() != 4 {
                 return Err(KexError::Ipc(format!(
-                    "resize frame expects 4 bytes, got {payload_len}"
+                    "resize frame expects 4 bytes, got {}",
+                    payload.len()
                 )));
             }
-            let mut buf = [0u8; 4];
-            stream.read_exact(&mut buf).await?;
             BinaryFrame::Resize {
-                cols: u16::from_be_bytes([buf[0], buf[1]]),
-                rows: u16::from_be_bytes([buf[2], buf[3]]),
+                cols: u16::from_be_bytes([payload[0], payload[1]]),
+                rows: u16::from_be_bytes([payload[2], payload[3]]),
             }
         }
         FRAME_TYPE_DETACH => BinaryFrame::Detach,
-        FRAME_TYPE_CONTROL => {
-            let mut buf = vec![0u8; payload_len];
-            stream.read_exact(&mut buf).await?;
-            BinaryFrame::Control(buf)
-        }
+        FRAME_TYPE_CONTROL => BinaryFrame::Control(payload.to_vec()),
         _ => return Err(KexError::Ipc(format!("unknown frame type: {type_byte:#x}"))),
     };
 
