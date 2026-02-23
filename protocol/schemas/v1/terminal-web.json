@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://kex.dev/protocol/v1/terminal-web.json",
+  "definitions": {
+    "terminal.attach": {
+      "type": "object",
+      "required": ["terminalId"],
+      "properties": { "terminalId": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "terminal.detach": {
+      "type": "object",
+      "required": ["terminalId"],
+      "properties": { "terminalId": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "terminal.create": {
+      "type": "object",
+      "properties": {
+        "deviceId": { "type": "string" },
+        "name": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "terminal.kill": {
+      "type": "object",
+      "required": ["terminalId"],
+      "properties": { "terminalId": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "terminal.snapshot": {
+      "type": "object",
+      "required": ["terminalId", "rows", "cols"],
+      "properties": {
+        "terminalId": { "type": "string" },
+        "rows": { "type": "integer" },
+        "cols": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "terminal.created": {
+      "type": "object",
+      "required": ["terminalId"],
+      "properties": {
+        "terminalId": { "type": "string" },
+        "name": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "terminal.killed": {
+      "type": "object",
+      "required": ["terminalId"],
+      "properties": { "terminalId": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "terminal.exited": {
+      "type": "object",
+      "required": ["terminalId"],
+      "properties": { "terminalId": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "terminal.web-attach": {
+      "type": "object",
+      "required": ["terminalId"],
+      "properties": { "terminalId": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "terminal.web-detach": {
+      "type": "object",
+      "required": ["terminalId"],
+      "properties": { "terminalId": { "type": "string" } },
+      "additionalProperties": false
+    }
+  }
+}

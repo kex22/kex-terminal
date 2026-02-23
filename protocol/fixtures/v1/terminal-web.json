@@ -1,0 +1,13 @@
+[
+  { "v": 1, "type": "terminal.attach", "payload": { "terminalId": "a1b2c3d4" } },
+  { "v": 1, "type": "terminal.detach", "payload": { "terminalId": "a1b2c3d4" } },
+  { "v": 1, "type": "terminal.create", "payload": { "deviceId": "dev-001", "name": "web-shell" } },
+  { "v": 1, "type": "terminal.create", "payload": {} },
+  { "v": 1, "type": "terminal.kill", "payload": { "terminalId": "a1b2c3d4" } },
+  { "v": 1, "type": "terminal.snapshot", "payload": { "terminalId": "a1b2c3d4", "rows": 24, "cols": 80 } },
+  { "v": 1, "type": "terminal.created", "payload": { "terminalId": "a1b2c3d4", "name": "web-shell" } },
+  { "v": 1, "type": "terminal.killed", "payload": { "terminalId": "a1b2c3d4" } },
+  { "v": 1, "type": "terminal.exited", "payload": { "terminalId": "a1b2c3d4" } },
+  { "v": 1, "type": "terminal.web-attach", "payload": { "terminalId": "a1b2c3d4" } },
+  { "v": 1, "type": "terminal.web-detach", "payload": { "terminalId": "a1b2c3d4" } }
+]
