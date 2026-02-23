@@ -169,15 +169,7 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                             Ok(())
                         } else {
                             let label = label.unwrap_or_else(|| id.clone());
-                            let mut client = IpcClient::connect().await?;
-                            match client.send(Request::TerminalAttach { id }).await? {
-                                Response::Ok => {
-                                    kex::terminal::attach::attach(client.into_stream(), &label)
-                                        .await
-                                }
-                                Response::Error { message } => Err(KexError::Server(message)),
-                                _ => Ok(()),
-                            }
+                            kex::terminal::attach::attach(&label).await
                         }
                     }
                     Response::Error { message } => Err(KexError::Server(message)),
@@ -213,17 +205,7 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                     _ => Ok(()),
                 }
             }
-            TerminalAction::Attach { id } => {
-                let mut client = IpcClient::connect().await?;
-                match client
-                    .send(Request::TerminalAttach { id: id.clone() })
-                    .await?
-                {
-                    Response::Ok => kex::terminal::attach::attach(client.into_stream(), &id).await,
-                    Response::Error { message } => Err(KexError::Server(message)),
-                    _ => Ok(()),
-                }
-            }
+            TerminalAction::Attach { id } => kex::terminal::attach::attach(&id).await,
         },
         Command::View { action } => match action {
             ViewAction::Create { name, terminal } => {
@@ -296,27 +278,14 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
                             return Err(KexError::Server("view has no terminals".into()));
                         }
                         let label = terminal_ids[0].clone();
-                        let mut client = IpcClient::connect().await?;
-                        match client
-                            .send(Request::TerminalAttach {
-                                id: terminal_ids[0].clone(),
-                            })
-                            .await?
-                        {
-                            Response::Ok => {
-                                kex::terminal::attach::attach_view(
-                                    client.into_stream(),
-                                    &label,
-                                    &terminal_ids[1..],
-                                    Some(&id),
-                                    layout,
-                                    focused,
-                                )
-                                .await
-                            }
-                            Response::Error { message } => Err(KexError::Server(message)),
-                            _ => Ok(()),
-                        }
+                        kex::terminal::attach::attach_view(
+                            &label,
+                            &terminal_ids[1..],
+                            Some(&id),
+                            layout,
+                            focused,
+                        )
+                        .await
                     }
                     Response::Error { message } => Err(KexError::Server(message)),
                     _ => Ok(()),

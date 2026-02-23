@@ -1,6 +1,7 @@
 pub mod client;
 pub mod codec;
 pub mod message;
+pub mod mux;
 
 use std::path::PathBuf;
 

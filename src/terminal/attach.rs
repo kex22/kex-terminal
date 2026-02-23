@@ -5,28 +5,24 @@ use crossterm::event::{Event, EventStream};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{ExecutableCommand, cursor};
 use futures_lite::StreamExt;
-use tokio::net::UnixStream;
-use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::error::Result;
 use crate::ipc::client::IpcClient;
-use crate::ipc::codec::{read_binary_frame, write_binary_frame};
-use crate::ipc::message::{BinaryFrame, Request, Response, ViewInfo};
+use crate::ipc::message::{BinaryFrame, MuxRequest, Request, Response, ViewInfo};
+use crate::ipc::mux::{LocalMuxSender, local_mux_connect};
 use crate::tui::input::{Action, InputHandler};
 use crate::tui::layout::{PaneLayout, SplitDirection};
 use crate::tui::renderer::Renderer;
 use crate::tui::screen::Screen;
 use crate::tui::vterm::VirtualTerminal;
 
-pub async fn attach(stream: UnixStream, terminal_name: &str) -> Result<()> {
-    attach_view(stream, terminal_name, &[], None, None, None).await
+pub async fn attach(terminal_name: &str) -> Result<()> {
+    attach_view(terminal_name, &[], None, None, None).await
 }
 
 pub async fn attach_view(
-    mut stream: UnixStream,
     terminal_name: &str,
     extra_terminals: &[String],
     view_id: Option<&str>,
@@ -35,17 +31,29 @@ pub async fn attach_view(
 ) -> Result<()> {
     let config = Config::load().unwrap_or_default();
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
+
+    // Build full terminal list for mux connection
+    let mut all_ids = vec![terminal_name.to_string()];
+    for t in extra_terminals {
+        if !all_ids.contains(t) {
+            all_ids.push(t.clone());
+        }
+    }
+
+    let (mut mux_tx, mux_rx) = local_mux_connect(all_ids, view_id.map(String::from)).await?;
+
+    // Send initial resize for primary terminal
     let screen = Screen::new(rows, cols);
     let pane = screen.pane_area();
-    write_binary_frame(
-        &mut stream,
-        terminal_name,
-        &BinaryFrame::Resize {
-            cols: pane.width,
-            rows: pane.height,
-        },
-    )
-    .await?;
+    mux_tx
+        .send_frame(
+            terminal_name,
+            &BinaryFrame::Resize {
+                cols: pane.width,
+                rows: pane.height,
+            },
+        )
+        .await?;
 
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -53,7 +61,8 @@ pub async fn attach_view(
     stdout.execute(cursor::Hide)?;
 
     let result = run_tui(TuiInit {
-        stream,
+        mux_tx,
+        mux_rx,
         terminal_name,
         cols,
         rows,
@@ -76,13 +85,11 @@ pub async fn attach_view(
 struct TuiSession {
     layout: PaneLayout,
     vterms: HashMap<String, VirtualTerminal>,
-    writers: HashMap<String, OwnedWriteHalf>,
-    read_tasks: HashMap<String, JoinHandle<()>>,
+    mux_tx: LocalMuxSender<tokio::net::unix::OwnedWriteHalf>,
     screen: Screen,
     renderer: Renderer<io::Stdout>,
     input: InputHandler,
     config: Config,
-    tx: mpsc::Sender<(String, Vec<u8>)>,
     view_id: Option<String>,
     label: String,
 }
@@ -160,9 +167,9 @@ impl TuiSession {
             if let Some(vterm) = self.vterms.get_mut(&tid) {
                 vterm.resize(rect.height, rect.width);
             }
-            if let Some(w) = self.writers.get_mut(&tid) {
-                let _ = write_binary_frame(
-                    w,
+            let _ = self
+                .mux_tx
+                .send_frame(
                     &tid,
                     &BinaryFrame::Resize {
                         cols: rect.width,
@@ -170,7 +177,6 @@ impl TuiSession {
                     },
                 )
                 .await;
-            }
         }
         Ok(())
     }
@@ -198,27 +204,35 @@ impl TuiSession {
             }
         }
 
-        let mut client = IpcClient::connect().await?;
-        let new_id = match client.send(Request::TerminalCreate { name: None }).await? {
-            Response::TerminalCreated { id } => id,
+        let new_id = match self
+            .mux_tx
+            .send_control(&MuxRequest::CreateTerminal { name: None })
+            .await?
+        {
+            crate::ipc::message::MuxResponse::TerminalCreated { id } => id,
             _ => return Ok(()),
         };
 
-        let mut client = IpcClient::connect().await?;
-        if !matches!(
-            client
-                .send(Request::TerminalAttach { id: new_id.clone() })
-                .await?,
-            Response::Ok
-        ) {
-            if let Ok(mut c) = IpcClient::connect().await {
-                let _ = c.send(Request::TerminalKill { id: new_id }).await;
+        match self
+            .mux_tx
+            .send_control(&MuxRequest::AddTerminal { id: new_id.clone() })
+            .await?
+        {
+            crate::ipc::message::MuxResponse::Ok => {}
+            _ => {
+                let _ = self
+                    .mux_tx
+                    .send_control(&MuxRequest::KillTerminal { id: new_id })
+                    .await;
+                return Ok(());
             }
-            return Ok(());
         }
 
-        self.spawn_terminal(new_id.clone(), client.into_stream())
-            .await?;
+        let pane = self.screen.pane_area();
+        self.vterms.insert(
+            new_id.clone(),
+            VirtualTerminal::new(pane.height, pane.width),
+        );
         self.layout.split(direction, new_id.clone());
         self.resize_all_vterms().await?;
         self.render_all()?;
@@ -241,12 +255,10 @@ impl TuiSession {
     async fn handle_close(&mut self) -> Result<()> {
         if let Some(closed) = self.layout.close_focused() {
             self.vterms.remove(&closed);
-            if let Some(task) = self.read_tasks.remove(&closed) {
-                task.abort();
-            }
-            if let Some(mut w) = self.writers.remove(&closed) {
-                let _ = write_binary_frame(&mut w, &closed, &BinaryFrame::Detach).await;
-            }
+            let _ = self
+                .mux_tx
+                .send_control(&MuxRequest::RemoveTerminal { id: closed.clone() })
+                .await;
             self.resize_all_vterms().await?;
             self.render_all()?;
 
@@ -282,16 +294,15 @@ impl TuiSession {
         }
 
         let new_set: std::collections::HashSet<&String> = terminal_ids.iter().collect();
-        let old_ids: Vec<String> = self.writers.keys().cloned().collect();
+        let old_ids: Vec<String> = self.vterms.keys().cloned().collect();
 
+        // Remove terminals not in new set
         for id in &old_ids {
             if !new_set.contains(id) {
-                if let Some(task) = self.read_tasks.remove(id) {
-                    task.abort();
-                }
-                if let Some(mut w) = self.writers.remove(id) {
-                    let _ = write_binary_frame(&mut w, id, &BinaryFrame::Detach).await;
-                }
+                let _ = self
+                    .mux_tx
+                    .send_control(&MuxRequest::RemoveTerminal { id: id.clone() })
+                    .await;
                 self.vterms.remove(id);
             }
         }
@@ -301,46 +312,15 @@ impl TuiSession {
 
         let pane_area = self.screen.pane_area();
         for tid in terminal_ids {
-            if !self.writers.contains_key(tid) {
-                let mut client = IpcClient::connect().await?;
-                if !matches!(
-                    client
-                        .send(Request::TerminalAttach { id: tid.clone() })
-                        .await?,
-                    Response::Ok
-                ) {
-                    continue;
-                }
-                let stream = client.into_stream();
-                let (sock_read, mut sock_write) = stream.into_split();
-                let _ = write_binary_frame(
-                    &mut sock_write,
-                    tid,
-                    &BinaryFrame::Resize {
-                        cols: pane_area.width,
-                        rows: pane_area.height,
-                    },
-                )
-                .await;
-                self.writers.insert(tid.clone(), sock_write);
+            if !self.vterms.contains_key(tid) {
+                // Add terminal to mux connection
+                let _ = self
+                    .mux_tx
+                    .send_control(&MuxRequest::AddTerminal { id: tid.clone() })
+                    .await;
                 self.vterms.insert(
                     tid.clone(),
                     VirtualTerminal::new(pane_area.height, pane_area.width),
-                );
-                let tx_clone = self.tx.clone();
-                let tid_clone = tid.clone();
-                self.read_tasks.insert(
-                    tid.clone(),
-                    tokio::spawn(async move {
-                        let mut sock_read = sock_read;
-                        while let Ok((_, BinaryFrame::Data(data))) =
-                            read_binary_frame(&mut sock_read).await
-                        {
-                            if tx_clone.send((tid_clone.clone(), data)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }),
                 );
             }
             if tid != first
@@ -358,41 +338,6 @@ impl TuiSession {
         self.render_all()
     }
 
-    async fn spawn_terminal(&mut self, id: String, stream: UnixStream) -> Result<()> {
-        let rects = self.layout.compute_rects(self.screen.pane_area());
-        let (h, w) = rects
-            .iter()
-            .find(|(tid, _)| tid == &id)
-            .map(|(_, r)| (r.height, r.width))
-            .unwrap_or((24, 80));
-        self.vterms.insert(id.clone(), VirtualTerminal::new(h, w));
-
-        let (sock_read, mut sock_write) = stream.into_split();
-        write_binary_frame(
-            &mut sock_write,
-            &id,
-            &BinaryFrame::Resize { cols: w, rows: h },
-        )
-        .await?;
-        self.writers.insert(id.clone(), sock_write);
-
-        let tx_clone = self.tx.clone();
-        let tid = id.clone();
-        self.read_tasks.insert(
-            id,
-            tokio::spawn(async move {
-                let mut sock_read = sock_read;
-                while let Ok((_, BinaryFrame::Data(data))) = read_binary_frame(&mut sock_read).await
-                {
-                    if tx_clone.send((tid.clone(), data)).await.is_err() {
-                        break;
-                    }
-                }
-            }),
-        );
-        Ok(())
-    }
-
     async fn sync_layout(&self) {
         if let Some(vid) = &self.view_id
             && let Ok(mut c) = IpcClient::connect().await
@@ -408,14 +353,16 @@ impl TuiSession {
     }
 
     async fn detach_all(&mut self) {
-        for (tid, mut w) in self.writers.drain() {
-            let _ = write_binary_frame(&mut w, &tid, &BinaryFrame::Detach).await;
-        }
+        let _ = self
+            .mux_tx
+            .send_frame("\0\0\0\0\0\0\0\0", &BinaryFrame::Detach)
+            .await;
     }
 }
 
 struct TuiInit<'a> {
-    stream: UnixStream,
+    mux_tx: LocalMuxSender<tokio::net::unix::OwnedWriteHalf>,
+    mux_rx: crate::ipc::mux::LocalMuxReceiver<tokio::net::unix::OwnedReadHalf>,
     terminal_name: &'a str,
     cols: u16,
     rows: u16,
@@ -441,60 +388,43 @@ async fn run_tui(init: TuiInit<'_>) -> Result<()> {
     let mut session = TuiSession {
         layout,
         vterms: HashMap::new(),
-        writers: HashMap::new(),
-        read_tasks: HashMap::new(),
+        mux_tx: init.mux_tx,
         screen: Screen::new(init.rows, init.cols),
         renderer: Renderer::new(io::stdout()),
         input: InputHandler::with_prefix(init.config.prefix.clone()),
         config: init.config,
-        tx: tx.clone(),
         view_id: init.view_id.map(String::from),
         label: init.terminal_name.to_string(),
     };
 
+    // Create vterms for all terminals (already attached via mux handshake)
     session.vterms.insert(
         init.terminal_name.to_string(),
         VirtualTerminal::new(pane_area.height, pane_area.width),
     );
-
-    // Spawn reader for initial terminal
-    let (sock_read, sock_write) = init.stream.into_split();
-    session
-        .writers
-        .insert(init.terminal_name.to_string(), sock_write);
-    let tx_clone = tx.clone();
-    let initial_id = init.terminal_name.to_string();
-    session.read_tasks.insert(
-        init.terminal_name.to_string(),
-        tokio::spawn(async move {
-            let mut sock_read = sock_read;
-            while let Ok((_, BinaryFrame::Data(data))) = read_binary_frame(&mut sock_read).await {
-                if tx_clone.send((initial_id.clone(), data)).await.is_err() {
-                    break;
-                }
-            }
-        }),
-    );
-    drop(tx);
-
-    // Connect extra terminals for view restore
     for tid in init.extra_terminals {
-        let mut client = IpcClient::connect().await?;
-        if !matches!(
-            client
-                .send(Request::TerminalAttach { id: tid.clone() })
-                .await?,
-            Response::Ok
-        ) {
-            continue;
-        }
-        let stream = client.into_stream();
+        session.vterms.insert(
+            tid.clone(),
+            VirtualTerminal::new(pane_area.height, pane_area.width),
+        );
         if !has_saved_layout {
             session.layout.split(SplitDirection::Vertical, tid.clone());
         }
-        session.spawn_terminal(tid.clone(), stream).await?;
     }
 
+    // Single recv task for all terminals
+    let mut mux_rx = init.mux_rx;
+    tokio::spawn(async move {
+        while let Ok((tid, frame)) = mux_rx.recv_frame().await {
+            if let BinaryFrame::Data(data) = frame
+                && tx.send((tid, data)).await.is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    session.resize_all_vterms().await?;
     session.render_all()?;
 
     let mut event_reader = EventStream::new();
@@ -512,8 +442,7 @@ async fn run_tui(init: TuiInit<'_>) -> Result<()> {
                 match session.input.handle_event(&event) {
                     Action::SendToTerminal(bytes) => {
                         let focused = session.layout.focused_terminal().to_string();
-                        if let Some(w) = session.writers.get_mut(&focused)
-                            && write_binary_frame(w, &focused, &BinaryFrame::Data(bytes)).await.is_err()
+                        if session.mux_tx.send_frame(&focused, &BinaryFrame::Data(bytes)).await.is_err()
                         {
                             break;
                         }
