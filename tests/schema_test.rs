@@ -83,6 +83,14 @@ fn fixture_error_validates() {
 }
 
 #[test]
+fn fixture_terminal_web_validates() {
+    let fixture = load_json(&format!("{}/terminal-web.json", fixture_dir()));
+    validate_fixture_envelope(&fixture);
+    let schema = load_json(&format!("{}/terminal-web.json", schema_dir()));
+    validate_fixture_payloads(&fixture, &schema);
+}
+
+#[test]
 fn all_fixtures_have_version_1() {
     let dir = Path::new(fixture_dir());
     for entry in fs::read_dir(dir).unwrap() {
