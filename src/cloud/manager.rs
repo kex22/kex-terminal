@@ -403,11 +403,10 @@ impl CloudManager {
     }
 
     async fn handle_terminal_output(&mut self, id: &str, data: Vec<u8>) {
-        // Feed into vt100 parser for snapshot capability
-        if let Some(t) = self.terminals.get_mut(id) {
-            t.parser.process(&data);
-        }
-        // Forward as binary Data frame to D.O.
+        let Some(t) = self.terminals.get_mut(id) else {
+            return;
+        };
+        t.parser.process(&data);
         if self.ws_write.is_some() {
             let frame = encode_binary_frame(id, 0x01, &data);
             let _ = self.ws_send_binary(frame).await;
@@ -488,11 +487,17 @@ impl CloudManager {
     }
 
     async fn handle_web_create(&mut self, name: Option<String>) {
-        let (id, term_name) = {
+        let result = {
             let mut mgr = self.manager.lock().await;
-            match mgr.create(name.clone()) {
-                Ok(id) => (id.clone(), mgr.get(&id).and_then(|t| t.name.clone())),
-                Err(_) => return,
+            mgr.create(name.clone())
+                .map(|id| (id.clone(), mgr.get(&id).and_then(|t| t.name.clone())))
+        };
+        let (id, term_name) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = envelope("error", serde_json::json!({ "message": e.to_string() }));
+                let _ = self.ws_send_text(&msg).await;
+                return;
             }
         };
 
@@ -540,31 +545,26 @@ impl CloudManager {
     }
 
     async fn handle_ws_binary(&mut self, data: &[u8]) {
-        // Binary frame from web client: [1B type][8B tid][4B len][payload]
-        if data.len() < 13 {
+        // WebSocket binary frame: [1B type][8B tid][payload]
+        // No length prefix — WebSocket messages are self-delimited.
+        if data.len() < 9 {
             return;
         }
         let frame_type = data[0];
         let tid = std::str::from_utf8(&data[1..9])
             .unwrap_or("")
             .trim_end_matches('\0');
-        let payload_len = u32::from_be_bytes([data[9], data[10], data[11], data[12]]) as usize;
-        if data.len() < 13 + payload_len {
-            return;
-        }
-        let payload = &data[13..13 + payload_len];
+        let payload = &data[9..];
 
         match frame_type {
             0x01 => {
-                // Data frame → write to PTY
                 if let Some(t) = self.terminals.get(tid)
                     && let Ok(mut w) = t.pty_writer.lock()
                 {
                     let _ = std::io::Write::write_all(&mut *w, payload);
                 }
             }
-            0x02 if payload_len == 4 => {
-                // Resize frame
+            0x02 if payload.len() == 4 => {
                 let cols = u16::from_be_bytes([payload[0], payload[1]]);
                 let rows = u16::from_be_bytes([payload[2], payload[3]]);
                 if let Some(t) = self.terminals.get_mut(tid) {
@@ -602,15 +602,15 @@ fn spawn_pty_reader(
     })
 }
 
+/// Encode a WebSocket binary frame: [1B type][8B terminal_id][payload].
+/// No length prefix — WebSocket messages are self-delimited.
 fn encode_binary_frame(terminal_id: &str, frame_type: u8, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(13 + payload.len());
+    let mut buf = Vec::with_capacity(9 + payload.len());
     buf.push(frame_type);
     let mut tid_bytes = [0u8; 8];
     let id_bytes = terminal_id.as_bytes();
-    let copy_len = id_bytes.len().min(8);
-    tid_bytes[..copy_len].copy_from_slice(&id_bytes[..copy_len]);
+    tid_bytes[..id_bytes.len().min(8)].copy_from_slice(&id_bytes[..id_bytes.len().min(8)]);
     buf.extend_from_slice(&tid_bytes);
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(payload);
     buf
 }
@@ -745,8 +745,7 @@ mod tests {
         let frame = encode_binary_frame("abcd1234", 0x01, b"hello");
         assert_eq!(frame[0], 0x01);
         assert_eq!(&frame[1..9], b"abcd1234");
-        assert_eq!(&frame[9..13], &5u32.to_be_bytes());
-        assert_eq!(&frame[13..], b"hello");
+        assert_eq!(&frame[9..], b"hello");
     }
 
     #[test]
