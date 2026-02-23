@@ -2,18 +2,24 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::credential;
+use crate::terminal::manager::TerminalManager;
+use crate::terminal::pty::PtyResizer;
 
 /// Commands sent to CloudManager from IPC handlers.
-#[derive(Debug)]
 pub enum CloudCommand {
     Sync {
         id: String,
         name: Option<String>,
+        pty_reader: Box<dyn std::io::Read + Send>,
+        pty_writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
+        pty_resizer: PtyResizer,
         reply: mpsc::Sender<Result<(), String>>,
     },
     Unsync {
@@ -22,23 +28,39 @@ pub enum CloudCommand {
     },
 }
 
+/// Internal events from PTY reader tasks.
+enum TerminalEvent {
+    Output { id: String, data: Vec<u8> },
+    Exited { id: String },
+}
+
 /// Shared synced terminal set — read by StatePersister, written by CloudManager.
 pub type SyncedSet = Arc<Mutex<HashSet<String>>>;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsRead = SplitStream<WsStream>;
+type WsWrite = SplitSink<WsStream, Message>;
 
-#[derive(Clone)]
 struct SyncedTerminal {
     id: String,
     name: Option<String>,
+    parser: vt100::Parser,
+    pty_writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
+    pty_resizer: PtyResizer,
+    reader_handle: JoinHandle<()>,
 }
 
 pub struct CloudManager {
     rx: mpsc::Receiver<CloudCommand>,
+    event_rx: mpsc::Receiver<TerminalEvent>,
+    event_tx: mpsc::Sender<TerminalEvent>,
     synced: SyncedSet,
     terminals: HashMap<String, SyncedTerminal>,
-    conn: Option<WsStream>,
+    manager: Arc<Mutex<TerminalManager>>,
+    cloud_tx: mpsc::Sender<CloudCommand>,
+    ws_read: Option<WsRead>,
+    ws_write: Option<WsWrite>,
     backoff: Duration,
     disconnect_at: Option<tokio::time::Instant>,
 }
@@ -49,13 +71,22 @@ const RESP_TIMEOUT: Duration = Duration::from_secs(10);
 const DISCONNECT_DELAY: Duration = Duration::from_secs(30);
 
 impl CloudManager {
-    pub fn spawn(synced: SyncedSet) -> mpsc::Sender<CloudCommand> {
+    pub fn spawn(
+        synced: SyncedSet,
+        manager: Arc<Mutex<TerminalManager>>,
+    ) -> mpsc::Sender<CloudCommand> {
         let (tx, rx) = mpsc::channel(32);
+        let (event_tx, event_rx) = mpsc::channel(256);
         let mgr = CloudManager {
             rx,
+            event_rx,
+            event_tx,
             synced,
             terminals: HashMap::new(),
-            conn: None,
+            manager,
+            cloud_tx: tx.clone(),
+            ws_read: None,
+            ws_write: None,
             backoff: Duration::from_secs(1),
             disconnect_at: None,
         };
@@ -68,7 +99,7 @@ impl CloudManager {
         heartbeat.tick().await; // skip immediate tick
 
         loop {
-            let has_conn = self.conn.is_some();
+            let has_conn = self.ws_write.is_some();
             let disconnect_at = self.disconnect_at;
             tokio::select! {
                 biased;
@@ -76,6 +107,22 @@ impl CloudManager {
                     match cmd {
                         Some(cmd) => self.handle_cmd(cmd).await,
                         None => break,
+                    }
+                }
+                event = self.event_rx.recv() => {
+                    if let Some(event) = event {
+                        self.handle_event(event).await;
+                    }
+                }
+                msg = async {
+                    match &mut self.ws_read {
+                        Some(r) => r.next().await,
+                        None => std::future::pending().await,
+                    }
+                }, if has_conn => {
+                    match msg {
+                        Some(Ok(msg)) => self.handle_ws_message(msg).await,
+                        _ => self.drop_conn(),
                     }
                 }
                 _ = tokio::time::sleep_until(disconnect_at.unwrap_or(tokio::time::Instant::now())), if disconnect_at.is_some() && has_conn => {
@@ -91,8 +138,17 @@ impl CloudManager {
 
     async fn handle_cmd(&mut self, cmd: CloudCommand) {
         match cmd {
-            CloudCommand::Sync { id, name, reply } => {
-                let result = self.handle_sync(id, name).await;
+            CloudCommand::Sync {
+                id,
+                name,
+                pty_reader,
+                pty_writer,
+                pty_resizer,
+                reply,
+            } => {
+                let result = self
+                    .handle_sync(id, name, pty_reader, pty_writer, pty_resizer)
+                    .await;
                 let _ = reply.send(result).await;
             }
             CloudCommand::Unsync { id, reply } => {
@@ -102,20 +158,19 @@ impl CloudManager {
         }
     }
 
-    async fn handle_sync(&mut self, id: String, name: Option<String>) -> Result<(), String> {
+    async fn handle_sync(
+        &mut self,
+        id: String,
+        name: Option<String>,
+        pty_reader: Box<dyn std::io::Read + Send>,
+        pty_writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
+        pty_resizer: PtyResizer,
+    ) -> Result<(), String> {
         let cred = credential::load().map_err(|e| e.to_string())?;
 
         // Cancel pending delayed disconnect
         self.disconnect_at = None;
 
-        // Insert BEFORE sending so device.status includes this terminal
-        self.terminals.insert(
-            id.clone(),
-            SyncedTerminal {
-                id: id.clone(),
-                name: name.clone(),
-            },
-        );
         self.synced.lock().await.insert(id.clone());
 
         let mut payload = serde_json::json!({ "terminalId": &id });
@@ -124,11 +179,24 @@ impl CloudManager {
         }
 
         if let Err(e) = self.send_and_confirm(&cred, "terminal.sync", payload).await {
-            // Rollback on failure
-            self.terminals.remove(&id);
             self.synced.lock().await.remove(&id);
             return Err(e);
         }
+
+        // Spawn PTY reader task
+        let reader_handle = spawn_pty_reader(id.clone(), pty_reader, self.event_tx.clone());
+
+        self.terminals.insert(
+            id.clone(),
+            SyncedTerminal {
+                id,
+                name,
+                parser: vt100::Parser::new(24, 80, 0),
+                pty_writer,
+                pty_resizer,
+                reader_handle,
+            },
+        );
 
         Ok(())
     }
@@ -144,10 +212,11 @@ impl CloudManager {
         self.send_and_confirm(&cred, "terminal.unsync", payload)
             .await?;
 
-        self.terminals.remove(&id);
+        if let Some(t) = self.terminals.remove(&id) {
+            t.reader_handle.abort();
+        }
         self.synced.lock().await.remove(&id);
 
-        // Schedule delayed disconnect if no more synced terminals
         if self.terminals.is_empty() {
             self.disconnect_at = Some(tokio::time::Instant::now() + DISCONNECT_DELAY);
         }
@@ -165,13 +234,13 @@ impl CloudManager {
         self.ensure_connected(cred).await?;
 
         let msg = envelope(msg_type, payload);
-        if let Err(e) = self.ws_send(&msg).await {
-            self.conn = None;
+        if let Err(e) = self.ws_send_text(&msg).await {
+            self.drop_conn();
             return Err(e);
         }
 
         // Wait for response (terminal.sync.ok, or error)
-        match self.ws_recv().await {
+        match self.ws_recv_text().await {
             Ok(resp) => {
                 let resp_type = resp["type"].as_str().unwrap_or("");
                 if resp_type == "error" || resp_type == "auth.error" {
@@ -183,14 +252,14 @@ impl CloudManager {
                 Ok(())
             }
             Err(e) => {
-                self.conn = None;
+                self.drop_conn();
                 Err(e)
             }
         }
     }
 
     async fn ensure_connected(&mut self, cred: &credential::Credential) -> Result<(), String> {
-        if self.conn.is_some() {
+        if self.ws_write.is_some() {
             return Ok(());
         }
 
@@ -205,7 +274,7 @@ impl CloudManager {
             format!("WebSocket connect failed: {e}")
         })?;
 
-        // Auth handshake
+        // Auth handshake (before split — simpler sequential flow)
         let auth = envelope("auth", serde_json::json!({ "token": &cred.token }));
         ws.send(Message::Text(auth.into()))
             .await
@@ -233,28 +302,38 @@ impl CloudManager {
             _ => return Err("unexpected non-text auth response".into()),
         }
 
-        self.conn = Some(ws);
+        // Split into read/write halves for concurrent use in select!
+        let (write, read) = ws.split();
+        self.ws_write = Some(write);
+        self.ws_read = Some(read);
         self.backoff = Duration::from_secs(1);
 
         // Send device.status on (re)connect for full sync
         let status = self.build_device_status();
-        if let Err(e) = self.ws_send(&status).await {
-            self.conn = None;
+        if let Err(e) = self.ws_send_text(&status).await {
+            self.drop_conn();
             return Err(e);
         }
 
         Ok(())
     }
 
-    async fn ws_send(&mut self, text: &str) -> Result<(), String> {
-        let ws = self.conn.as_mut().ok_or("not connected")?;
+    async fn ws_send_text(&mut self, text: &str) -> Result<(), String> {
+        let ws = self.ws_write.as_mut().ok_or("not connected")?;
         ws.send(Message::Text(text.to_string().into()))
             .await
             .map_err(|e| format!("send failed: {e}"))
     }
 
-    async fn ws_recv(&mut self) -> Result<serde_json::Value, String> {
-        let ws = self.conn.as_mut().ok_or("not connected")?;
+    async fn ws_send_binary(&mut self, data: Vec<u8>) -> Result<(), String> {
+        let ws = self.ws_write.as_mut().ok_or("not connected")?;
+        ws.send(Message::Binary(data.into()))
+            .await
+            .map_err(|e| format!("send failed: {e}"))
+    }
+
+    async fn ws_recv_text(&mut self) -> Result<serde_json::Value, String> {
+        let ws = self.ws_read.as_mut().ok_or("not connected")?;
         let msg = tokio::time::timeout(RESP_TIMEOUT, ws.next())
             .await
             .map_err(|_| "response timeout".to_string())?
@@ -270,18 +349,24 @@ impl CloudManager {
     }
 
     async fn heartbeat(&mut self) {
-        let Some(ws) = self.conn.as_mut() else {
+        let Some(ws) = self.ws_write.as_mut() else {
             return;
         };
         if ws.send(Message::Ping(vec![].into())).await.is_err() {
-            self.conn = None;
+            self.drop_conn();
         }
     }
 
     async fn disconnect(&mut self) {
-        if let Some(mut ws) = self.conn.take() {
-            let _ = ws.close(None).await;
+        if let Some(mut ws) = self.ws_write.take() {
+            let _ = ws.close().await;
         }
+        self.ws_read = None;
+    }
+
+    fn drop_conn(&mut self) {
+        self.ws_write = None;
+        self.ws_read = None;
     }
 
     fn bump_backoff(&mut self) {
@@ -305,6 +390,229 @@ impl CloudManager {
             serde_json::json!({ "syncedTerminals": terminals }),
         )
     }
+
+    async fn handle_event(&mut self, event: TerminalEvent) {
+        match event {
+            TerminalEvent::Output { id, data } => {
+                self.handle_terminal_output(&id, data).await;
+            }
+            TerminalEvent::Exited { id } => {
+                self.handle_terminal_exited(&id).await;
+            }
+        }
+    }
+
+    async fn handle_terminal_output(&mut self, id: &str, data: Vec<u8>) {
+        // Feed into vt100 parser for snapshot capability
+        if let Some(t) = self.terminals.get_mut(id) {
+            t.parser.process(&data);
+        }
+        // Forward as binary Data frame to D.O.
+        if self.ws_write.is_some() {
+            let frame = encode_binary_frame(id, 0x01, &data);
+            let _ = self.ws_send_binary(frame).await;
+        }
+    }
+
+    async fn handle_terminal_exited(&mut self, id: &str) {
+        if self.terminals.remove(id).is_none() {
+            return;
+        }
+        self.synced.lock().await.remove(id);
+        if self.ws_write.is_some() {
+            let msg = envelope("terminal.exited", serde_json::json!({ "terminalId": id }));
+            let _ = self.ws_send_text(&msg).await;
+        }
+        if self.terminals.is_empty() {
+            self.disconnect_at = Some(tokio::time::Instant::now() + DISCONNECT_DELAY);
+        }
+    }
+
+    async fn handle_ws_message(&mut self, msg: Message) {
+        match msg {
+            Message::Text(text) => {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    return;
+                };
+                self.handle_ws_text(v).await;
+            }
+            Message::Binary(data) => {
+                self.handle_ws_binary(&data).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_ws_text(&mut self, msg: serde_json::Value) {
+        let msg_type = msg["type"].as_str().unwrap_or("");
+        match msg_type {
+            "terminal.web-attach" => {
+                let Some(tid) = msg["payload"]["terminalId"].as_str() else {
+                    return;
+                };
+                self.handle_web_attach(tid).await;
+            }
+            "terminal.web-detach" => { /* D.O. manages subscriptions, nothing to do */ }
+            "terminal.create" => {
+                let name = msg["payload"]["name"].as_str().map(String::from);
+                self.handle_web_create(name).await;
+            }
+            "terminal.kill" => {
+                let Some(tid) = msg["payload"]["terminalId"].as_str() else {
+                    return;
+                };
+                self.handle_web_kill(tid.to_string()).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_web_attach(&mut self, tid: &str) {
+        let Some(t) = self.terminals.get(tid) else {
+            return;
+        };
+        let screen = t.parser.screen();
+        let (rows, cols) = screen.size();
+        let snapshot_data = screen.contents_formatted();
+
+        // Send JSON metadata
+        let meta = envelope(
+            "terminal.snapshot",
+            serde_json::json!({ "terminalId": tid, "rows": rows, "cols": cols }),
+        );
+        let _ = self.ws_send_text(&meta).await;
+
+        // Send binary Data frame with snapshot content
+        let frame = encode_binary_frame(tid, 0x01, &snapshot_data);
+        let _ = self.ws_send_binary(frame).await;
+    }
+
+    async fn handle_web_create(&mut self, name: Option<String>) {
+        let (id, term_name) = {
+            let mut mgr = self.manager.lock().await;
+            match mgr.create(name.clone()) {
+                Ok(id) => (id.clone(), mgr.get(&id).and_then(|t| t.name.clone())),
+                Err(_) => return,
+            }
+        };
+
+        // Auto-sync the new terminal
+        let mgr = self.manager.lock().await;
+        let Some(t) = mgr.get(&id) else { return };
+        let Ok(pty_reader) = t.pty.clone_reader() else {
+            return;
+        };
+        let pty_writer = t.pty.clone_writer();
+        let pty_resizer = t.pty.clone_resizer();
+        drop(mgr);
+
+        if self
+            .handle_sync(
+                id.clone(),
+                term_name.clone(),
+                pty_reader,
+                pty_writer,
+                pty_resizer,
+            )
+            .await
+            .is_ok()
+        {
+            let msg = envelope(
+                "terminal.created",
+                serde_json::json!({ "terminalId": &id, "name": term_name }),
+            );
+            let _ = self.ws_send_text(&msg).await;
+        }
+    }
+
+    async fn handle_web_kill(&mut self, id: String) {
+        // Unsync first (if synced)
+        if self.terminals.contains_key(&id) {
+            let _ = self.handle_unsync(id.clone()).await;
+        }
+        // Kill the terminal
+        let mut mgr = self.manager.lock().await;
+        if mgr.kill(&id).is_ok() {
+            drop(mgr);
+            let msg = envelope("terminal.killed", serde_json::json!({ "terminalId": &id }));
+            let _ = self.ws_send_text(&msg).await;
+        }
+    }
+
+    async fn handle_ws_binary(&mut self, data: &[u8]) {
+        // Binary frame from web client: [1B type][8B tid][4B len][payload]
+        if data.len() < 13 {
+            return;
+        }
+        let frame_type = data[0];
+        let tid = std::str::from_utf8(&data[1..9])
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        let payload_len = u32::from_be_bytes([data[9], data[10], data[11], data[12]]) as usize;
+        if data.len() < 13 + payload_len {
+            return;
+        }
+        let payload = &data[13..13 + payload_len];
+
+        match frame_type {
+            0x01 => {
+                // Data frame → write to PTY
+                if let Some(t) = self.terminals.get(tid)
+                    && let Ok(mut w) = t.pty_writer.lock()
+                {
+                    let _ = std::io::Write::write_all(&mut *w, payload);
+                }
+            }
+            0x02 if payload_len == 4 => {
+                // Resize frame
+                let cols = u16::from_be_bytes([payload[0], payload[1]]);
+                let rows = u16::from_be_bytes([payload[2], payload[3]]);
+                if let Some(t) = self.terminals.get_mut(tid) {
+                    let _ = t.pty_resizer.resize(cols, rows);
+                    t.parser.screen_mut().set_size(rows, cols);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn spawn_pty_reader(
+    id: String,
+    mut reader: Box<dyn std::io::Read + Send>,
+    tx: mpsc::Sender<TerminalEvent>,
+) -> JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let event = TerminalEvent::Output {
+                        id: id.clone(),
+                        data: buf[..n].to_vec(),
+                    };
+                    if tx.blocking_send(event).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tx.blocking_send(TerminalEvent::Exited { id });
+    })
+}
+
+fn encode_binary_frame(terminal_id: &str, frame_type: u8, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(13 + payload.len());
+    buf.push(frame_type);
+    let mut tid_bytes = [0u8; 8];
+    let id_bytes = terminal_id.as_bytes();
+    let copy_len = id_bytes.len().min(8);
+    tid_bytes[..copy_len].copy_from_slice(&id_bytes[..copy_len]);
+    buf.extend_from_slice(&tid_bytes);
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(payload);
+    buf
 }
 
 fn envelope(msg_type: &str, payload: serde_json::Value) -> String {
@@ -314,6 +622,27 @@ fn envelope(msg_type: &str, payload: serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::pty::Pty;
+
+    fn test_manager() -> Arc<Mutex<TerminalManager>> {
+        Arc::new(Mutex::new(TerminalManager::new()))
+    }
+
+    fn make_sync_cmd(
+        id: &str,
+        name: Option<&str>,
+        reply: mpsc::Sender<Result<(), String>>,
+    ) -> CloudCommand {
+        let pty = Pty::spawn().unwrap();
+        CloudCommand::Sync {
+            id: id.into(),
+            name: name.map(String::from),
+            pty_reader: pty.clone_reader().unwrap(),
+            pty_writer: pty.clone_writer(),
+            pty_resizer: pty.clone_resizer(),
+            reply,
+        }
+    }
 
     #[test]
     fn envelope_format() {
@@ -327,16 +656,12 @@ mod tests {
     #[tokio::test]
     async fn sync_without_credentials_returns_error() {
         let synced = Arc::new(Mutex::new(HashSet::new()));
-        let tx = CloudManager::spawn(synced.clone());
+        let tx = CloudManager::spawn(synced.clone(), test_manager());
 
         let (reply_tx, mut reply_rx) = mpsc::channel(1);
-        tx.send(CloudCommand::Sync {
-            id: "t1".into(),
-            name: Some("test".into()),
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
+        tx.send(make_sync_cmd("t1", Some("test"), reply_tx))
+            .await
+            .unwrap();
 
         let result = reply_rx.recv().await.unwrap();
         assert!(result.is_err());
@@ -346,7 +671,7 @@ mod tests {
     #[tokio::test]
     async fn unsync_unknown_terminal_returns_error() {
         let synced = Arc::new(Mutex::new(HashSet::new()));
-        let tx = CloudManager::spawn(synced);
+        let tx = CloudManager::spawn(synced, test_manager());
 
         let (reply_tx, mut reply_rx) = mpsc::channel(1);
         tx.send(CloudCommand::Unsync {
@@ -361,15 +686,22 @@ mod tests {
         assert!(result.unwrap_err().contains("not synced"));
     }
 
-    #[test]
-    fn build_device_status_includes_terminals() {
-        // Verify device.status payload structure
+    #[tokio::test]
+    async fn build_device_status_includes_terminals() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let pty1 = Pty::spawn().unwrap();
+        let pty2 = Pty::spawn().unwrap();
+
         let mut terminals = HashMap::new();
         terminals.insert(
             "t1".into(),
             SyncedTerminal {
                 id: "t1".into(),
                 name: Some("dev".into()),
+                parser: vt100::Parser::new(24, 80, 0),
+                pty_writer: pty1.clone_writer(),
+                pty_resizer: pty1.clone_resizer(),
+                reader_handle: tokio::spawn(async {}),
             },
         );
         terminals.insert(
@@ -377,14 +709,23 @@ mod tests {
             SyncedTerminal {
                 id: "t2".into(),
                 name: None,
+                parser: vt100::Parser::new(24, 80, 0),
+                pty_writer: pty2.clone_writer(),
+                pty_resizer: pty2.clone_resizer(),
+                reader_handle: tokio::spawn(async {}),
             },
         );
 
         let mgr = CloudManager {
             rx: mpsc::channel(1).1,
+            event_rx,
+            event_tx,
             synced: Arc::new(Mutex::new(HashSet::new())),
             terminals,
-            conn: None,
+            manager: Arc::new(Mutex::new(TerminalManager::new())),
+            cloud_tx: mpsc::channel(1).0,
+            ws_read: None,
+            ws_write: None,
             backoff: Duration::from_secs(1),
             disconnect_at: None,
         };
@@ -394,9 +735,139 @@ mod tests {
         assert_eq!(v["type"], "device.status");
         let list = v["payload"]["syncedTerminals"].as_array().unwrap();
         assert_eq!(list.len(), 2);
-        // One should have name, one should not
         let has_name = list.iter().any(|t| t.get("name").is_some());
         let no_name = list.iter().any(|t| t.get("name").is_none());
         assert!(has_name && no_name);
+    }
+
+    #[test]
+    fn encode_binary_frame_format() {
+        let frame = encode_binary_frame("abcd1234", 0x01, b"hello");
+        assert_eq!(frame[0], 0x01);
+        assert_eq!(&frame[1..9], b"abcd1234");
+        assert_eq!(&frame[9..13], &5u32.to_be_bytes());
+        assert_eq!(&frame[13..], b"hello");
+    }
+
+    #[test]
+    fn encode_binary_frame_pads_short_id() {
+        let frame = encode_binary_frame("ab", 0x02, b"x");
+        assert_eq!(&frame[1..3], b"ab");
+        assert_eq!(&frame[3..9], &[0u8; 6]);
+    }
+
+    #[tokio::test]
+    async fn handle_ws_binary_writes_to_pty() {
+        let pty = Pty::spawn().unwrap();
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let mut mgr = CloudManager {
+            rx: mpsc::channel(1).1,
+            event_rx,
+            event_tx,
+            synced: Arc::new(Mutex::new(HashSet::new())),
+            terminals: HashMap::new(),
+            manager: test_manager(),
+            cloud_tx: mpsc::channel(1).0,
+            ws_read: None,
+            ws_write: None,
+            backoff: Duration::from_secs(1),
+            disconnect_at: None,
+        };
+        mgr.terminals.insert(
+            "abcd1234".into(),
+            SyncedTerminal {
+                id: "abcd1234".into(),
+                name: None,
+                parser: vt100::Parser::new(24, 80, 0),
+                pty_writer: pty.clone_writer(),
+                pty_resizer: pty.clone_resizer(),
+                reader_handle: tokio::spawn(async {}),
+            },
+        );
+
+        // Send a data frame (type 0x01)
+        let frame = encode_binary_frame("abcd1234", 0x01, b"ls\n");
+        mgr.handle_ws_binary(&frame).await;
+
+        // Verify data was written (no panic = PTY accepted the write)
+    }
+
+    #[tokio::test]
+    async fn handle_ws_binary_resize_updates_parser() {
+        let pty = Pty::spawn().unwrap();
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let mut mgr = CloudManager {
+            rx: mpsc::channel(1).1,
+            event_rx,
+            event_tx,
+            synced: Arc::new(Mutex::new(HashSet::new())),
+            terminals: HashMap::new(),
+            manager: test_manager(),
+            cloud_tx: mpsc::channel(1).0,
+            ws_read: None,
+            ws_write: None,
+            backoff: Duration::from_secs(1),
+            disconnect_at: None,
+        };
+        mgr.terminals.insert(
+            "abcd1234".into(),
+            SyncedTerminal {
+                id: "abcd1234".into(),
+                name: None,
+                parser: vt100::Parser::new(24, 80, 0),
+                pty_writer: pty.clone_writer(),
+                pty_resizer: pty.clone_resizer(),
+                reader_handle: tokio::spawn(async {}),
+            },
+        );
+
+        // Resize frame: type 0x02, payload = [cols_hi, cols_lo, rows_hi, rows_lo]
+        let mut resize_payload = Vec::new();
+        resize_payload.extend_from_slice(&100u16.to_be_bytes()); // cols
+        resize_payload.extend_from_slice(&50u16.to_be_bytes()); // rows
+        let frame = encode_binary_frame("abcd1234", 0x02, &resize_payload);
+        mgr.handle_ws_binary(&frame).await;
+
+        let t = mgr.terminals.get("abcd1234").unwrap();
+        let (rows, cols) = t.parser.screen().size();
+        assert_eq!(rows, 50);
+        assert_eq!(cols, 100);
+    }
+
+    #[tokio::test]
+    async fn handle_terminal_output_feeds_parser() {
+        let pty = Pty::spawn().unwrap();
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let mut mgr = CloudManager {
+            rx: mpsc::channel(1).1,
+            event_rx,
+            event_tx,
+            synced: Arc::new(Mutex::new(HashSet::new())),
+            terminals: HashMap::new(),
+            manager: test_manager(),
+            cloud_tx: mpsc::channel(1).0,
+            ws_read: None,
+            ws_write: None,
+            backoff: Duration::from_secs(1),
+            disconnect_at: None,
+        };
+        mgr.terminals.insert(
+            "abcd1234".into(),
+            SyncedTerminal {
+                id: "abcd1234".into(),
+                name: None,
+                parser: vt100::Parser::new(24, 80, 0),
+                pty_writer: pty.clone_writer(),
+                pty_resizer: pty.clone_resizer(),
+                reader_handle: tokio::spawn(async {}),
+            },
+        );
+
+        mgr.handle_terminal_output("abcd1234", b"hello world".to_vec())
+            .await;
+
+        let t = mgr.terminals.get("abcd1234").unwrap();
+        let contents = t.parser.screen().contents();
+        assert!(contents.contains("hello world"));
     }
 }

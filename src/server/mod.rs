@@ -58,7 +58,7 @@ impl Server {
         let synced = Arc::new(Mutex::new(prev_synced));
         let persister =
             StatePersister::spawn(manager.clone(), view_manager.clone(), synced.clone());
-        let cloud_tx = CloudManager::spawn(synced);
+        let cloud_tx = CloudManager::spawn(synced, manager.clone());
 
         let server = Server {
             listener,
@@ -316,12 +316,29 @@ async fn handle_connection(
                 .await;
             };
             let name = t.name.clone();
+            let pty_reader = match t.pty.clone_reader() {
+                Ok(r) => r,
+                Err(e) => {
+                    return write_message(
+                        &mut stream,
+                        &Response::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
+                }
+            };
+            let pty_writer = t.pty.clone_writer();
+            let pty_resizer = t.pty.clone_resizer();
             drop(mgr);
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
             let _ = cloud_tx
                 .send(CloudCommand::Sync {
                     id,
                     name,
+                    pty_reader,
+                    pty_writer,
+                    pty_resizer,
                     reply: reply_tx,
                 })
                 .await;
@@ -1085,7 +1102,7 @@ mod tests {
         let (mut client, server) = paired_streams().await;
         let (mgr, vmgr, persister) = test_managers();
         let synced = Arc::new(Mutex::new(HashSet::new()));
-        let cloud_tx = CloudManager::spawn(synced);
+        let cloud_tx = CloudManager::spawn(synced, mgr.clone());
 
         let handle = tokio::spawn(handle_connection(
             server,
@@ -1112,7 +1129,7 @@ mod tests {
         let (mut client, server) = paired_streams().await;
         let (mgr, vmgr, persister) = test_managers();
         let synced = Arc::new(Mutex::new(HashSet::new()));
-        let cloud_tx = CloudManager::spawn(synced.clone());
+        let cloud_tx = CloudManager::spawn(synced.clone(), mgr.clone());
 
         let tid = mgr.lock().await.create(None).unwrap();
 
