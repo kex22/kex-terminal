@@ -51,6 +51,14 @@ pub enum Request {
         view_id: String,
         terminal_id: String,
     },
+    ProxyExpose {
+        port: u16,
+        public: bool,
+    },
+    ProxyUnexpose {
+        port: u16,
+    },
+    ProxyList,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,6 +93,13 @@ pub enum Response {
         layout: Option<Value>,
         focused: Option<String>,
     },
+    ProxyExposed {
+        port: u16,
+        url: String,
+    },
+    ProxyList {
+        ports: Vec<ProxyPortInfo>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +115,13 @@ pub struct ViewInfo {
     pub name: Option<String>,
     pub terminal_ids: Vec<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyPortInfo {
+    pub port: u16,
+    pub public: bool,
+    pub url: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]

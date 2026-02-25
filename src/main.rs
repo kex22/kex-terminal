@@ -37,6 +37,11 @@ enum Command {
     },
     /// Logout from kex cloud
     Logout,
+    /// Manage URL proxies for local ports
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -124,6 +129,25 @@ enum ConfigAction {
     Show,
     /// Show configuration file path
     Path,
+}
+
+#[derive(Subcommand)]
+enum ProxyAction {
+    /// Expose a local port via URL
+    Create {
+        /// Port number to expose
+        port: u16,
+        /// Make publicly accessible (default: private, owner-only)
+        #[arg(long)]
+        public: bool,
+    },
+    /// Stop exposing a port
+    Rm {
+        /// Port number to unexpose
+        port: u16,
+    },
+    /// List exposed ports
+    Ls,
 }
 
 fn main() {
@@ -352,5 +376,53 @@ async fn run(cli: Cli) -> kex::error::Result<()> {
         },
         Command::Login { server } => kex::cloud::login::login(&server).await,
         Command::Logout => kex::cloud::login::logout().await,
+        Command::Proxy { action } => match action {
+            ProxyAction::Create { port, public } => {
+                let mut client = IpcClient::connect().await?;
+                match client.send(Request::ProxyExpose { port, public }).await? {
+                    Response::ProxyExposed { port, url } => {
+                        println!("port {port} exposed: {url}");
+                        Ok(())
+                    }
+                    Response::Error { message } => Err(KexError::Server(message)),
+                    _ => Ok(()),
+                }
+            }
+            ProxyAction::Rm { port } => {
+                let mut client = IpcClient::connect().await?;
+                match client.send(Request::ProxyUnexpose { port }).await? {
+                    Response::Ok => {
+                        println!("port {port} unexposed");
+                        Ok(())
+                    }
+                    Response::Error { message } => Err(KexError::Server(message)),
+                    _ => Ok(()),
+                }
+            }
+            ProxyAction::Ls => {
+                let mut client = IpcClient::connect().await?;
+                match client.send(Request::ProxyList).await? {
+                    Response::ProxyList { ports } => {
+                        if ports.is_empty() {
+                            println!("no exposed ports");
+                        } else {
+                            println!("{:<8} {:<8} URL", "PORT", "ACCESS");
+                            for p in ports {
+                                let access = if p.public { "public" } else { "private" };
+                                println!(
+                                    "{:<8} {:<8} {}",
+                                    p.port,
+                                    access,
+                                    p.url.as_deref().unwrap_or("-")
+                                );
+                            }
+                        }
+                        Ok(())
+                    }
+                    Response::Error { message } => Err(KexError::Server(message)),
+                    _ => Ok(()),
+                }
+            }
+        },
     }
 }

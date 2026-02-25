@@ -17,7 +17,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 vt100 = "0.16"
 futures-lite = "2"
 toml = "0.8"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 open = "5"
 hostname = "0.4"
 machine-uid = "0.5"

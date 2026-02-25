@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://kex.sh/protocol/v1/proxy-expose.json",
+  "definitions": {
+    "proxy.expose": {
+      "type": "object",
+      "required": ["port", "public"],
+      "properties": {
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "public": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "proxy.unexpose": {
+      "type": "object",
+      "required": ["port"],
+      "properties": {
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      },
+      "additionalProperties": false
+    },
+    "proxy.expose.ok": {
+      "type": "object",
+      "required": ["port", "url"],
+      "properties": {
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "url": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "proxy.expose.error": {
+      "type": "object",
+      "required": ["port", "message"],
+      "properties": {
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

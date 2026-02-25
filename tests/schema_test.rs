@@ -91,6 +91,30 @@ fn fixture_terminal_web_validates() {
 }
 
 #[test]
+fn fixture_proxy_expose_validates() {
+    let fixture = load_json(&format!("{}/proxy-expose.json", fixture_dir()));
+    validate_fixture_envelope(&fixture);
+    let schema = load_json(&format!("{}/proxy-expose.json", schema_dir()));
+    validate_fixture_payloads(&fixture, &schema);
+}
+
+#[test]
+fn fixture_proxy_request_validates() {
+    let fixture = load_json(&format!("{}/proxy-request.json", fixture_dir()));
+    validate_fixture_envelope(&fixture);
+    let schema = load_json(&format!("{}/proxy-request.json", schema_dir()));
+    validate_fixture_payloads(&fixture, &schema);
+}
+
+#[test]
+fn fixture_proxy_response_validates() {
+    let fixture = load_json(&format!("{}/proxy-response.json", fixture_dir()));
+    validate_fixture_envelope(&fixture);
+    let schema = load_json(&format!("{}/proxy-response.json", schema_dir()));
+    validate_fixture_payloads(&fixture, &schema);
+}
+
+#[test]
 fn all_fixtures_have_version_1() {
     let dir = Path::new(fixture_dir());
     for entry in fs::read_dir(dir).unwrap() {

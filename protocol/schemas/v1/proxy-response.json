@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://kex.sh/protocol/v1/proxy-response.json",
+  "definitions": {
+    "proxy.response.head": {
+      "type": "object",
+      "required": ["requestId", "status", "headers"],
+      "properties": {
+        "requestId": { "type": "string" },
+        "status": { "type": "integer" },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "proxy.response.end": {
+      "type": "object",
+      "required": ["requestId"],
+      "properties": {
+        "requestId": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "proxy.response.error": {
+      "type": "object",
+      "required": ["requestId", "message"],
+      "properties": {
+        "requestId": { "type": "string" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

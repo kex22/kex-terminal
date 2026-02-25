@@ -8,5 +8,18 @@
         { "id": "t5e6f7g8" }
       ]
     }
+  },
+  {
+    "v": 1,
+    "type": "device.status",
+    "payload": {
+      "syncedTerminals": [
+        { "id": "t1a2b3c4", "name": "dev" }
+      ],
+      "exposedPorts": [
+        { "port": 3000, "public": false },
+        { "port": 5173, "public": true }
+      ]
+    }
   }
 ]

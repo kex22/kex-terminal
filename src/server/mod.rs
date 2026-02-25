@@ -158,6 +158,8 @@ async fn handle_connection(
             | Request::ViewAddTerminal { .. }
             | Request::ViewUpdateLayout { .. }
             | Request::ViewRemoveTerminal { .. }
+            | Request::ProxyExpose { .. }
+            | Request::ProxyUnexpose { .. }
     );
     let resp = match req {
         Request::ServerStop => {
@@ -364,6 +366,49 @@ async fn handle_connection(
                 None => Response::Error {
                     message: "cloud manager unavailable".into(),
                 },
+            }
+        }
+        Request::ProxyExpose { port, public } => {
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+            let _ = cloud_tx
+                .send(CloudCommand::ProxyExpose {
+                    port,
+                    public,
+                    reply: reply_tx,
+                })
+                .await;
+            match reply_rx.recv().await {
+                Some(Ok(url)) => Response::ProxyExposed { port, url },
+                Some(Err(e)) => Response::Error { message: e },
+                None => Response::Error {
+                    message: "cloud manager unavailable".into(),
+                },
+            }
+        }
+        Request::ProxyUnexpose { port } => {
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+            let _ = cloud_tx
+                .send(CloudCommand::ProxyUnexpose {
+                    port,
+                    reply: reply_tx,
+                })
+                .await;
+            match reply_rx.recv().await {
+                Some(Ok(())) => Response::Ok,
+                Some(Err(e)) => Response::Error { message: e },
+                None => Response::Error {
+                    message: "cloud manager unavailable".into(),
+                },
+            }
+        }
+        Request::ProxyList => {
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+            let _ = cloud_tx
+                .send(CloudCommand::ProxyList { reply: reply_tx })
+                .await;
+            match reply_rx.recv().await {
+                Some(ports) => Response::ProxyList { ports },
+                None => Response::ProxyList { ports: vec![] },
             }
         }
     };

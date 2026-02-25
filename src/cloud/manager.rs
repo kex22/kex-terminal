@@ -8,6 +8,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::cloud::proxy;
+use crate::cloud::proxy::ProxyState;
 use crate::credential;
 use crate::terminal::manager::TerminalManager;
 use crate::terminal::pty::PtyResizer;
@@ -26,12 +28,44 @@ pub enum CloudCommand {
         id: String,
         reply: mpsc::Sender<Result<(), String>>,
     },
+    ProxyExpose {
+        port: u16,
+        public: bool,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+    ProxyUnexpose {
+        port: u16,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    ProxyList {
+        reply: mpsc::Sender<Vec<crate::ipc::message::ProxyPortInfo>>,
+    },
 }
 
 /// Internal events from PTY reader tasks.
 enum TerminalEvent {
     Output { id: String, data: Vec<u8> },
     Exited { id: String },
+}
+
+/// Internal events from proxy tasks (localhost HTTP responses).
+enum ProxyEvent {
+    Head {
+        request_id: String,
+        status: u16,
+        headers: HashMap<String, String>,
+    },
+    Body {
+        request_id: String,
+        data: Vec<u8>,
+    },
+    End {
+        request_id: String,
+    },
+    Error {
+        request_id: String,
+        message: String,
+    },
 }
 
 /// Shared synced terminal set — read by StatePersister, written by CloudManager.
@@ -62,6 +96,10 @@ pub struct CloudManager {
     ws_write: Option<WsWrite>,
     backoff: Duration,
     disconnect_at: Option<tokio::time::Instant>,
+    proxy: ProxyState,
+    pending_expose: HashMap<u16, mpsc::Sender<Result<String, String>>>,
+    proxy_event_tx: mpsc::Sender<ProxyEvent>,
+    proxy_event_rx: mpsc::Receiver<ProxyEvent>,
 }
 
 const HEARTBEAT_SECS: u64 = 30;
@@ -76,6 +114,7 @@ impl CloudManager {
     ) -> mpsc::Sender<CloudCommand> {
         let (tx, rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(256);
+        let (proxy_event_tx, proxy_event_rx) = mpsc::channel(256);
         let mgr = CloudManager {
             rx,
             event_rx,
@@ -87,6 +126,10 @@ impl CloudManager {
             ws_write: None,
             backoff: Duration::from_secs(1),
             disconnect_at: None,
+            proxy: ProxyState::new(),
+            pending_expose: HashMap::new(),
+            proxy_event_tx,
+            proxy_event_rx,
         };
         tokio::spawn(mgr.run());
         tx
@@ -110,6 +153,11 @@ impl CloudManager {
                 event = self.event_rx.recv() => {
                     if let Some(event) = event {
                         self.handle_event(event).await;
+                    }
+                }
+                proxy_ev = self.proxy_event_rx.recv() => {
+                    if let Some(ev) = proxy_ev {
+                        self.handle_proxy_event(ev).await;
                     }
                 }
                 msg = async {
@@ -152,6 +200,30 @@ impl CloudManager {
             CloudCommand::Unsync { id, reply } => {
                 let result = self.handle_unsync(id).await;
                 let _ = reply.send(result).await;
+            }
+            CloudCommand::ProxyExpose {
+                port,
+                public,
+                reply,
+            } => {
+                self.handle_proxy_expose(port, public, reply).await;
+            }
+            CloudCommand::ProxyUnexpose { port, reply } => {
+                let result = self.handle_proxy_unexpose(port).await;
+                let _ = reply.send(result).await;
+            }
+            CloudCommand::ProxyList { reply } => {
+                let list = self
+                    .proxy
+                    .exposed_ports
+                    .values()
+                    .map(|ep| crate::ipc::message::ProxyPortInfo {
+                        port: ep.port,
+                        public: ep.public,
+                        url: ep.url.clone(),
+                    })
+                    .collect();
+                let _ = reply.send(list).await;
             }
         }
     }
@@ -220,6 +292,84 @@ impl CloudManager {
         }
 
         Ok(())
+    }
+
+    async fn handle_proxy_expose(
+        &mut self,
+        port: u16,
+        public: bool,
+        reply: mpsc::Sender<Result<String, String>>,
+    ) {
+        let cred = match credential::load() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = reply.send(Err(e.to_string())).await;
+                return;
+            }
+        };
+        if let Err(e) = self.ensure_connected(&cred).await {
+            let _ = reply.send(Err(e)).await;
+            return;
+        }
+
+        self.proxy.expose(port, public);
+        self.pending_expose.insert(port, reply);
+
+        let msg = envelope(
+            "proxy.expose",
+            serde_json::json!({ "port": port, "public": public }),
+        );
+        if let Err(e) = self.ws_send_text(&msg).await {
+            self.pending_expose.remove(&port);
+            self.proxy.unexpose(port);
+            // reply already moved, can't send error — it was consumed by insert
+            self.drop_conn();
+            let _ = e; // connection dropped, reply channel will close
+        }
+    }
+
+    async fn handle_proxy_unexpose(&mut self, port: u16) -> Result<(), String> {
+        if !self.proxy.exposed_ports.contains_key(&port) {
+            return Err(format!("port {port} is not exposed"));
+        }
+
+        let cred = credential::load().map_err(|e| e.to_string())?;
+        self.ensure_connected(&cred).await?;
+
+        let msg = envelope("proxy.unexpose", serde_json::json!({ "port": port }));
+        self.ws_send_text(&msg).await?;
+        self.proxy.unexpose(port);
+        Ok(())
+    }
+
+    async fn handle_proxy_request_head(&mut self, payload: &serde_json::Value) {
+        let request_id = payload["requestId"].as_str().unwrap_or("").to_string();
+        let method = payload["method"].as_str().unwrap_or("GET").to_string();
+        let path = payload["path"].as_str().unwrap_or("/").to_string();
+        let port = payload["port"].as_u64().unwrap_or(0) as u16;
+        let headers: HashMap<String, String> = payload["headers"]
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if port == 0 || request_id.is_empty() {
+            return;
+        }
+
+        let tx = self.proxy_event_tx.clone();
+        let rid = request_id.clone();
+
+        let handle = tokio::spawn(async move {
+            proxy_request_task(rid, method, port, path, headers, tx).await;
+        });
+
+        self.proxy
+            .pending_requests
+            .insert(request_id, proxy::PendingProxyRequest { port, handle });
     }
 
     /// Ensure connected, send message, wait for confirmation response.
@@ -383,9 +533,18 @@ impl CloudManager {
                 v
             })
             .collect();
+        let exposed_ports: Vec<serde_json::Value> = self
+            .proxy
+            .exposed_ports
+            .values()
+            .map(|ep| serde_json::json!({ "port": ep.port, "public": ep.public }))
+            .collect();
         envelope(
             "device.status",
-            serde_json::json!({ "syncedTerminals": terminals }),
+            serde_json::json!({
+                "syncedTerminals": terminals,
+                "exposedPorts": exposed_ports,
+            }),
         )
     }
 
@@ -396,6 +555,50 @@ impl CloudManager {
             }
             TerminalEvent::Exited { id } => {
                 self.handle_terminal_exited(&id).await;
+            }
+        }
+    }
+
+    async fn handle_proxy_event(&mut self, event: ProxyEvent) {
+        match event {
+            ProxyEvent::Head {
+                request_id,
+                status,
+                headers,
+            } => {
+                let msg = envelope(
+                    "proxy.response.head",
+                    serde_json::json!({
+                        "requestId": request_id,
+                        "status": status,
+                        "headers": headers,
+                    }),
+                );
+                let _ = self.ws_send_text(&msg).await;
+            }
+            ProxyEvent::Body { request_id, data } => {
+                let frame =
+                    encode_binary_frame(&request_id, proxy::FRAME_PROXY_RESPONSE_BODY, &data);
+                let _ = self.ws_send_binary(frame).await;
+            }
+            ProxyEvent::End { request_id } => {
+                self.proxy.pending_requests.remove(&request_id);
+                let msg = envelope(
+                    "proxy.response.end",
+                    serde_json::json!({ "requestId": request_id }),
+                );
+                let _ = self.ws_send_text(&msg).await;
+            }
+            ProxyEvent::Error {
+                request_id,
+                message,
+            } => {
+                self.proxy.pending_requests.remove(&request_id);
+                let msg = envelope(
+                    "proxy.response.error",
+                    serde_json::json!({ "requestId": request_id, "message": message }),
+                );
+                let _ = self.ws_send_text(&msg).await;
             }
         }
     }
@@ -459,6 +662,36 @@ impl CloudManager {
                     return;
                 };
                 self.handle_web_kill(tid.to_string()).await;
+            }
+            "proxy.expose.ok" => {
+                let port = msg["payload"]["port"].as_u64().unwrap_or(0) as u16;
+                let url = msg["payload"]["url"].as_str().unwrap_or("").to_string();
+                self.proxy.set_url(port, url.clone());
+                if let Some(reply) = self.pending_expose.remove(&port) {
+                    let _ = reply.send(Ok(url)).await;
+                }
+            }
+            "proxy.expose.error" => {
+                let port = msg["payload"]["port"].as_u64().unwrap_or(0) as u16;
+                let message = msg["payload"]["message"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string();
+                self.proxy.unexpose(port);
+                if let Some(reply) = self.pending_expose.remove(&port) {
+                    let _ = reply.send(Err(message)).await;
+                }
+            }
+            "proxy.request.head" => {
+                self.handle_proxy_request_head(&msg["payload"]).await;
+            }
+            "proxy.request.end" => {
+                // For simple GET requests, request.end is a no-op (no body to finalize).
+                // POST/PUT body streaming will be handled in Phase 5b+.
+            }
+            "proxy.request.cancel" => {
+                let request_id = msg["payload"]["requestId"].as_str().unwrap_or("");
+                self.proxy.cancel_request(request_id);
             }
             _ => {}
         }
@@ -570,6 +803,10 @@ impl CloudManager {
                     t.parser.screen_mut().set_size(rows, cols);
                 }
             }
+            proxy::FRAME_PROXY_REQUEST_BODY => {
+                // POST/PUT request body streaming — Phase 5b+.
+                // For now, proxy tasks handle GET-only (no request body).
+            }
             _ => {}
         }
     }
@@ -598,6 +835,113 @@ fn spawn_pty_reader(
         }
         let _ = tx.blocking_send(TerminalEvent::Exited { id });
     })
+}
+
+/// Spawn a tokio task that connects to localhost and streams the response back
+/// via the proxy event channel.
+async fn proxy_request_task(
+    request_id: String,
+    method: String,
+    port: u16,
+    path: String,
+    headers: HashMap<String, String>,
+    tx: mpsc::Sender<ProxyEvent>,
+) {
+    let url = format!("http://127.0.0.1:{port}{path}");
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .unwrap_or_default();
+
+    let req_method = match method.as_str() {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
+        "HEAD" => reqwest::Method::HEAD,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        _ => reqwest::Method::GET,
+    };
+
+    let mut req = client.request(req_method, &url);
+    for (k, v) in &headers {
+        // Skip hop-by-hop headers
+        let lower = k.to_lowercase();
+        if matches!(
+            lower.as_str(),
+            "host" | "connection" | "transfer-encoding" | "keep-alive" | "upgrade"
+        ) {
+            continue;
+        }
+        req = req.header(k, v);
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx
+                .send(ProxyEvent::Error {
+                    request_id,
+                    message: format!("localhost connection failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    // Send response head
+    let status = resp.status().as_u16();
+    let resp_headers: HashMap<String, String> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+
+    if tx
+        .send(ProxyEvent::Head {
+            request_id: request_id.clone(),
+            status,
+            headers: resp_headers,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    // Stream response body in chunks
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt as _;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                if tx
+                    .send(ProxyEvent::Body {
+                        request_id: request_id.clone(),
+                        data: bytes.to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(ProxyEvent::Error {
+                        request_id,
+                        message: format!("read error: {e}"),
+                    })
+                    .await;
+                return;
+            }
+        }
+    }
+
+    let _ = tx.send(ProxyEvent::End { request_id }).await;
 }
 
 /// Encode a WebSocket binary frame: [1B type][8B terminal_id][payload].
@@ -714,6 +1058,7 @@ mod tests {
             },
         );
 
+        let (proxy_event_tx, proxy_event_rx) = mpsc::channel(1);
         let mgr = CloudManager {
             rx: mpsc::channel(1).1,
             event_rx,
@@ -725,6 +1070,10 @@ mod tests {
             ws_write: None,
             backoff: Duration::from_secs(1),
             disconnect_at: None,
+            proxy: ProxyState::new(),
+            pending_expose: HashMap::new(),
+            proxy_event_tx,
+            proxy_event_rx,
         };
 
         let msg = mgr.build_device_status();
@@ -756,6 +1105,7 @@ mod tests {
     async fn handle_ws_binary_writes_to_pty() {
         let pty = Pty::spawn().unwrap();
         let (event_tx, event_rx) = mpsc::channel(1);
+        let (proxy_event_tx, proxy_event_rx) = mpsc::channel(1);
         let mut mgr = CloudManager {
             rx: mpsc::channel(1).1,
             event_rx,
@@ -767,6 +1117,10 @@ mod tests {
             ws_write: None,
             backoff: Duration::from_secs(1),
             disconnect_at: None,
+            proxy: ProxyState::new(),
+            pending_expose: HashMap::new(),
+            proxy_event_tx,
+            proxy_event_rx,
         };
         mgr.terminals.insert(
             "abcd1234".into(),
@@ -791,6 +1145,7 @@ mod tests {
     async fn handle_ws_binary_resize_updates_parser() {
         let pty = Pty::spawn().unwrap();
         let (event_tx, event_rx) = mpsc::channel(1);
+        let (proxy_event_tx, proxy_event_rx) = mpsc::channel(1);
         let mut mgr = CloudManager {
             rx: mpsc::channel(1).1,
             event_rx,
@@ -802,6 +1157,10 @@ mod tests {
             ws_write: None,
             backoff: Duration::from_secs(1),
             disconnect_at: None,
+            proxy: ProxyState::new(),
+            pending_expose: HashMap::new(),
+            proxy_event_tx,
+            proxy_event_rx,
         };
         mgr.terminals.insert(
             "abcd1234".into(),
@@ -832,6 +1191,7 @@ mod tests {
     async fn handle_terminal_output_feeds_parser() {
         let pty = Pty::spawn().unwrap();
         let (event_tx, event_rx) = mpsc::channel(1);
+        let (proxy_event_tx, proxy_event_rx) = mpsc::channel(1);
         let mut mgr = CloudManager {
             rx: mpsc::channel(1).1,
             event_rx,
@@ -843,6 +1203,10 @@ mod tests {
             ws_write: None,
             backoff: Duration::from_secs(1),
             disconnect_at: None,
+            proxy: ProxyState::new(),
+            pending_expose: HashMap::new(),
+            proxy_event_tx,
+            proxy_event_rx,
         };
         mgr.terminals.insert(
             "abcd1234".into(),
@@ -862,5 +1226,89 @@ mod tests {
         let t = mgr.terminals.get("abcd1234").unwrap();
         let contents = t.parser.screen().contents();
         assert!(contents.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn build_device_status_includes_exposed_ports() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let (proxy_event_tx, proxy_event_rx) = mpsc::channel(1);
+        let mut mgr = CloudManager {
+            rx: mpsc::channel(1).1,
+            event_rx,
+            event_tx,
+            synced: Arc::new(Mutex::new(HashSet::new())),
+            terminals: HashMap::new(),
+            manager: test_manager(),
+            ws_read: None,
+            ws_write: None,
+            backoff: Duration::from_secs(1),
+            disconnect_at: None,
+            proxy: ProxyState::new(),
+            pending_expose: HashMap::new(),
+            proxy_event_tx,
+            proxy_event_rx,
+        };
+
+        mgr.proxy.expose(3000, false);
+        mgr.proxy.expose(8080, true);
+
+        let msg = mgr.build_device_status();
+        let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        let ports = v["payload"]["exposedPorts"].as_array().unwrap();
+        assert_eq!(ports.len(), 2);
+        let has_public = ports.iter().any(|p| p["public"] == true);
+        let has_private = ports.iter().any(|p| p["public"] == false);
+        assert!(has_public && has_private);
+    }
+
+    #[tokio::test]
+    async fn proxy_event_sends_response_head() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let (proxy_event_tx, proxy_event_rx) = mpsc::channel(1);
+        let mut mgr = CloudManager {
+            rx: mpsc::channel(1).1,
+            event_rx,
+            event_tx,
+            synced: Arc::new(Mutex::new(HashSet::new())),
+            terminals: HashMap::new(),
+            manager: test_manager(),
+            ws_read: None,
+            ws_write: None,
+            backoff: Duration::from_secs(1),
+            disconnect_at: None,
+            proxy: ProxyState::new(),
+            pending_expose: HashMap::new(),
+            proxy_event_tx,
+            proxy_event_rx,
+        };
+
+        // Without a WS connection, handle_proxy_event should not panic
+        let mut headers = HashMap::new();
+        headers.insert("content-type".into(), "text/html".into());
+        mgr.handle_proxy_event(ProxyEvent::Head {
+            request_id: "req12345".into(),
+            status: 200,
+            headers,
+        })
+        .await;
+        // No panic = success (no WS to send to, silently drops)
+    }
+
+    #[test]
+    fn proxy_state_expose_unexpose() {
+        let mut state = ProxyState::new();
+        state.expose(3000, false);
+        assert!(state.exposed_ports.contains_key(&3000));
+        assert!(!state.exposed_ports[&3000].public);
+
+        state.set_url(3000, "https://example.com".into());
+        assert_eq!(
+            state.exposed_ports[&3000].url.as_deref(),
+            Some("https://example.com")
+        );
+
+        assert!(state.unexpose(3000));
+        assert!(!state.exposed_ports.contains_key(&3000));
+        assert!(!state.unexpose(3000)); // already removed
     }
 }

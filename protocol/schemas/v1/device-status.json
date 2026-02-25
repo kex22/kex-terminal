@@ -17,6 +17,18 @@
             },
             "additionalProperties": false
           }
+        },
+        "exposedPorts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["port", "public"],
+            "properties": {
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "public": { "type": "boolean" }
+            },
+            "additionalProperties": false
+          }
         }
       },
       "additionalProperties": false

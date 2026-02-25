@@ -1,0 +1,7 @@
+[
+  { "v": 1, "type": "proxy.expose", "payload": { "port": 3000, "public": false } },
+  { "v": 1, "type": "proxy.expose", "payload": { "port": 5173, "public": true } },
+  { "v": 1, "type": "proxy.unexpose", "payload": { "port": 3000 } },
+  { "v": 1, "type": "proxy.expose.ok", "payload": { "port": 3000, "url": "https://app.kex.sh/@alice/devices/home-server/p/3000" } },
+  { "v": 1, "type": "proxy.expose.error", "payload": { "port": 3000, "message": "Port limit exceeded" } }
+]
