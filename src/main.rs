@@ -32,7 +32,7 @@ enum Command {
     /// Login to kex cloud
     Login {
         /// Server URL
-        #[arg(long, default_value = "https://app.kex.dev")]
+        #[arg(long, default_value = "https://app.kex.sh")]
         server: String,
     },
     /// Logout from kex cloud

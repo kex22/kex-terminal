@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://kex.dev/protocol/v1/device-status.json",
+  "$id": "https://kex.sh/protocol/v1/device-status.json",
   "definitions": {
     "device.status": {
       "type": "object",

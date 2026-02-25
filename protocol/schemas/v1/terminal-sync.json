@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://kex.dev/protocol/v1/terminal-sync.json",
+  "$id": "https://kex.sh/protocol/v1/terminal-sync.json",
   "definitions": {
     "terminal.sync": {
       "type": "object",

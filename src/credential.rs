@@ -67,7 +67,7 @@ mod tests {
 
         let cred = Credential {
             token: "test-token".into(),
-            server_url: "https://app.kex.dev".into(),
+            server_url: "https://app.kex.sh".into(),
         };
         save(&cred).unwrap();
         let loaded = load().unwrap();

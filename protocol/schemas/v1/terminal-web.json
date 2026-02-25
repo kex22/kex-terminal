@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://kex.dev/protocol/v1/terminal-web.json",
+  "$id": "https://kex.sh/protocol/v1/terminal-web.json",
   "definitions": {
     "terminal.attach": {
       "type": "object",
