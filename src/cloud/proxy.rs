@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// An exposed port registered via `kex proxy create`.
 #[derive(Debug, Clone)]
@@ -18,6 +19,7 @@ pub struct PendingProxyRequest {
 pub struct ProxyState {
     pub exposed_ports: HashMap<u16, ExposedPort>,
     pub pending_requests: HashMap<String, PendingProxyRequest>,
+    pub http_client: reqwest::Client,
 }
 
 impl Default for ProxyState {
@@ -28,9 +30,15 @@ impl Default for ProxyState {
 
 impl ProxyState {
     pub fn new() -> Self {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .no_proxy()
+            .build()
+            .unwrap_or_default();
         Self {
             exposed_ports: HashMap::new(),
             pending_requests: HashMap::new(),
+            http_client,
         }
     }
 

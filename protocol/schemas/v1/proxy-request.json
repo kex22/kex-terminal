@@ -4,11 +4,12 @@
   "definitions": {
     "proxy.request.head": {
       "type": "object",
-      "required": ["requestId", "method", "path", "headers"],
+      "required": ["requestId", "method", "path", "port", "headers"],
       "properties": {
         "requestId": { "type": "string" },
         "method": { "type": "string" },
         "path": { "type": "string" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "headers": {
           "type": "object",
           "additionalProperties": { "type": "string" }

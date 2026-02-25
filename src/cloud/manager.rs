@@ -362,9 +362,10 @@ impl CloudManager {
 
         let tx = self.proxy_event_tx.clone();
         let rid = request_id.clone();
+        let client = self.proxy.http_client.clone();
 
         let handle = tokio::spawn(async move {
-            proxy_request_task(rid, method, port, path, headers, tx).await;
+            proxy_request_task(rid, method, port, path, headers, tx, client).await;
         });
 
         self.proxy
@@ -515,6 +516,7 @@ impl CloudManager {
     fn drop_conn(&mut self) {
         self.ws_write = None;
         self.ws_read = None;
+        self.proxy.cancel_all_requests();
     }
 
     fn bump_backoff(&mut self) {
@@ -846,14 +848,9 @@ async fn proxy_request_task(
     path: String,
     headers: HashMap<String, String>,
     tx: mpsc::Sender<ProxyEvent>,
+    client: reqwest::Client,
 ) {
     let url = format!("http://127.0.0.1:{port}{path}");
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .unwrap_or_default();
 
     let req_method = match method.as_str() {
         "GET" => reqwest::Method::GET,
