@@ -399,6 +399,14 @@ impl CloudManager {
         let request_id = payload["requestId"].as_str().unwrap_or("").to_string();
         let path = payload["path"].as_str().unwrap_or("/").to_string();
         let port = payload["port"].as_u64().unwrap_or(0) as u16;
+        let headers: HashMap<String, String> = payload["headers"]
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         if port == 0 || request_id.is_empty() {
             let msg = envelope(
@@ -410,6 +418,19 @@ impl CloudManager {
         }
 
         let url = format!("ws://127.0.0.1:{port}{path}");
+        // Build WS request with forwarded headers
+        let mut req_builder = tokio_tungstenite::tungstenite::http::Request::builder().uri(&url);
+        for (k, v) in &headers {
+            let lower = k.to_lowercase();
+            if matches!(
+                lower.as_str(),
+                "host" | "connection" | "upgrade" | "sec-websocket-key" | "sec-websocket-version"
+            ) {
+                continue; // hop-by-hop / WS handshake headers managed by tungstenite
+            }
+            req_builder = req_builder.header(k.as_str(), v.as_str());
+        }
+        let ws_request = req_builder.body(()).unwrap();
         let proxy_tx = self.proxy_event_tx.clone();
         let rid = request_id.clone();
 
@@ -422,7 +443,7 @@ impl CloudManager {
         let reader_handle = tokio::spawn(async move {
             let connect_result = tokio::time::timeout(
                 Duration::from_secs(5),
-                tokio_tungstenite::connect_async(&url),
+                tokio_tungstenite::connect_async(ws_request),
             )
             .await;
 
@@ -491,12 +512,20 @@ impl CloudManager {
                                 reason,
                             })
                             .await;
-                        break;
+                        return; // already sent WsClose, skip post-loop cleanup
                     }
                     Err(_) => break,
                     _ => {} // Ping/Pong handled by tungstenite
                 }
             }
+            // Reader exited without a Close frame — notify main loop for cleanup
+            let _ = reader_tx
+                .send(ProxyEvent::WsClose {
+                    request_id: reader_rid,
+                    code: 1006,
+                    reason: "connection lost".into(),
+                })
+                .await;
         });
 
         // Writer task: mpsc channel → localhost WS
@@ -931,6 +960,9 @@ impl CloudManager {
                     .to_string();
                 let code = msg["payload"]["code"].as_u64().unwrap_or(1000) as u16;
                 let reason = msg["payload"]["reason"].as_str().unwrap_or("").to_string();
+                // Best-effort close: enqueue Close frame, then force-abort tasks.
+                // The writer may be aborted before sending the frame — acceptable
+                // for D.O.-initiated close (browser already disconnected).
                 if let Some(ws) = self.proxy.pending_ws.get(&request_id) {
                     let _ = ws
                         .writer_tx
