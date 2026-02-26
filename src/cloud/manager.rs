@@ -66,6 +66,23 @@ enum ProxyEvent {
         request_id: String,
         message: String,
     },
+    WsOpen {
+        request_id: String,
+    },
+    WsClose {
+        request_id: String,
+        code: u16,
+        reason: String,
+    },
+    WsError {
+        request_id: String,
+        message: String,
+    },
+    WsData {
+        request_id: String,
+        is_text: bool,
+        data: Vec<u8>,
+    },
 }
 
 /// Shared synced terminal set — read by StatePersister, written by CloudManager.
@@ -621,6 +638,49 @@ impl CloudManager {
                 );
                 let _ = self.ws_send_text(&msg).await;
             }
+            ProxyEvent::WsOpen { request_id } => {
+                let msg = envelope(
+                    "proxy.ws.open",
+                    serde_json::json!({ "requestId": request_id }),
+                );
+                let _ = self.ws_send_text(&msg).await;
+            }
+            ProxyEvent::WsClose {
+                request_id,
+                code,
+                reason,
+            } => {
+                self.proxy.cancel_ws(&request_id);
+                let msg = envelope(
+                    "proxy.ws.close",
+                    serde_json::json!({ "requestId": request_id, "code": code, "reason": reason }),
+                );
+                let _ = self.ws_send_text(&msg).await;
+            }
+            ProxyEvent::WsError {
+                request_id,
+                message,
+            } => {
+                self.proxy.cancel_ws(&request_id);
+                let msg = envelope(
+                    "proxy.ws.error",
+                    serde_json::json!({ "requestId": request_id, "message": message }),
+                );
+                let _ = self.ws_send_text(&msg).await;
+            }
+            ProxyEvent::WsData {
+                request_id,
+                is_text,
+                data,
+            } => {
+                let subtype = if is_text {
+                    proxy::WS_SUBTYPE_TEXT
+                } else {
+                    proxy::WS_SUBTYPE_BINARY
+                };
+                let frame = encode_ws_binary_frame(&request_id, subtype, &data);
+                let _ = self.ws_send_binary(frame).await;
+            }
         }
     }
 
@@ -969,6 +1029,19 @@ fn encode_binary_frame(id: &str, frame_type: u8, payload: &[u8]) -> Vec<u8> {
     let id_bytes = id.as_bytes();
     id_fixed[..id_bytes.len().min(8)].copy_from_slice(&id_bytes[..id_bytes.len().min(8)]);
     buf.extend_from_slice(&id_fixed);
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Encode a 0x22 WS proxy frame: [1B:0x22][8B:requestId][1B:subtype][payload]
+fn encode_ws_binary_frame(id: &str, subtype: u8, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(10 + payload.len());
+    buf.push(proxy::FRAME_PROXY_WS_DATA);
+    let mut id_fixed = [0u8; 8];
+    let id_bytes = id.as_bytes();
+    id_fixed[..id_bytes.len().min(8)].copy_from_slice(&id_bytes[..id_bytes.len().min(8)]);
+    buf.extend_from_slice(&id_fixed);
+    buf.push(subtype);
     buf.extend_from_slice(payload);
     buf
 }
@@ -1326,5 +1399,21 @@ mod tests {
         assert!(state.unexpose(3000));
         assert!(!state.exposed_ports.contains_key(&3000));
         assert!(!state.unexpose(3000)); // already removed
+    }
+
+    #[test]
+    fn encode_ws_binary_frame_format() {
+        let frame = encode_ws_binary_frame("ws1a2b3c", proxy::WS_SUBTYPE_TEXT, b"hello");
+        assert_eq!(frame[0], 0x22);
+        assert_eq!(&frame[1..9], b"ws1a2b3c");
+        assert_eq!(frame[9], 0x01); // text subtype
+        assert_eq!(&frame[10..], b"hello");
+    }
+
+    #[test]
+    fn encode_ws_binary_frame_binary_subtype() {
+        let frame = encode_ws_binary_frame("ws1a2b3c", proxy::WS_SUBTYPE_BINARY, &[0xFF, 0x00]);
+        assert_eq!(frame[9], 0x02); // binary subtype
+        assert_eq!(&frame[10..], &[0xFF, 0x00]);
     }
 }
