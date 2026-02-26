@@ -10,7 +10,12 @@
         "status": { "type": "integer" },
         "headers": {
           "type": "object",
-          "additionalProperties": { "type": "string" }
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          }
         }
       },
       "additionalProperties": false

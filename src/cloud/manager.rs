@@ -53,7 +53,7 @@ enum ProxyEvent {
     Head {
         request_id: String,
         status: u16,
-        headers: HashMap<String, String>,
+        headers: HashMap<String, Vec<String>>,
     },
     Body {
         request_id: String,
@@ -319,12 +319,12 @@ impl CloudManager {
             "proxy.expose",
             serde_json::json!({ "port": port, "public": public }),
         );
-        if let Err(e) = self.ws_send_text(&msg).await {
-            self.pending_expose.remove(&port);
+        if let Err(_) = self.ws_send_text(&msg).await {
+            if let Some(reply) = self.pending_expose.remove(&port) {
+                let _ = reply.send(Err("connection lost".into())).await;
+            }
             self.proxy.unexpose(port);
-            // reply already moved, can't send error — it was consumed by insert
             self.drop_conn();
-            let _ = e; // connection dropped, reply channel will close
         }
     }
 
@@ -357,6 +357,11 @@ impl CloudManager {
             .unwrap_or_default();
 
         if port == 0 || request_id.is_empty() {
+            let msg = envelope(
+                "proxy.response.error",
+                serde_json::json!({ "requestId": request_id, "message": "invalid port or requestId" }),
+            );
+            let _ = self.ws_send_text(&msg).await;
             return;
         }
 
@@ -568,12 +573,26 @@ impl CloudManager {
                 status,
                 headers,
             } => {
+                // Single-value → string, multi-value → array (per protocol schema)
+                let hdr_json: serde_json::Map<String, serde_json::Value> = headers
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let val = if v.len() == 1 {
+                            serde_json::Value::String(v.into_iter().next().unwrap())
+                        } else {
+                            serde_json::Value::Array(
+                                v.into_iter().map(serde_json::Value::String).collect(),
+                            )
+                        };
+                        (k, val)
+                    })
+                    .collect();
                 let msg = envelope(
                     "proxy.response.head",
                     serde_json::json!({
                         "requestId": request_id,
                         "status": status,
-                        "headers": headers,
+                        "headers": hdr_json,
                     }),
                 );
                 let _ = self.ws_send_text(&msg).await;
@@ -889,13 +908,13 @@ async fn proxy_request_task(
         }
     };
 
-    // Send response head
+    // Send response head — group duplicate header names (e.g. Set-Cookie)
     let status = resp.status().as_u16();
-    let resp_headers: HashMap<String, String> = resp
-        .headers()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-        .collect();
+    let mut resp_headers: HashMap<String, Vec<String>> = HashMap::new();
+    for (k, v) in resp.headers().iter() {
+        let val = v.to_str().unwrap_or("").to_string();
+        resp_headers.entry(k.to_string()).or_default().push(val);
+    }
 
     if tx
         .send(ProxyEvent::Head {
@@ -943,13 +962,13 @@ async fn proxy_request_task(
 
 /// Encode a WebSocket binary frame: [1B type][8B terminal_id][payload].
 /// No length prefix — WebSocket messages are self-delimited.
-fn encode_binary_frame(terminal_id: &str, frame_type: u8, payload: &[u8]) -> Vec<u8> {
+fn encode_binary_frame(id: &str, frame_type: u8, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(9 + payload.len());
     buf.push(frame_type);
-    let mut tid_bytes = [0u8; 8];
-    let id_bytes = terminal_id.as_bytes();
-    tid_bytes[..id_bytes.len().min(8)].copy_from_slice(&id_bytes[..id_bytes.len().min(8)]);
-    buf.extend_from_slice(&tid_bytes);
+    let mut id_fixed = [0u8; 8];
+    let id_bytes = id.as_bytes();
+    id_fixed[..id_bytes.len().min(8)].copy_from_slice(&id_bytes[..id_bytes.len().min(8)]);
+    buf.extend_from_slice(&id_fixed);
     buf.extend_from_slice(payload);
     buf
 }
@@ -1281,7 +1300,7 @@ mod tests {
 
         // Without a WS connection, handle_proxy_event should not panic
         let mut headers = HashMap::new();
-        headers.insert("content-type".into(), "text/html".into());
+        headers.insert("content-type".into(), vec!["text/html".into()]);
         mgr.handle_proxy_event(ProxyEvent::Head {
             request_id: "req12345".into(),
             status: 200,

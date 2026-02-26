@@ -7,6 +7,17 @@
       "headers": { "content-type": "text/html", "cache-control": "no-cache" }
     }
   },
+  {
+    "v": 1, "type": "proxy.response.head",
+    "payload": {
+      "requestId": "f9g0h1i2",
+      "status": 200,
+      "headers": {
+        "content-type": "text/html",
+        "set-cookie": ["sid=abc; Path=/; HttpOnly", "theme=dark; Path=/"]
+      }
+    }
+  },
   { "v": 1, "type": "proxy.response.end", "payload": { "requestId": "a1b2c3d4" } },
   { "v": 1, "type": "proxy.response.error", "payload": { "requestId": "e5f6g7h8", "message": "Connection refused" } }
 ]
