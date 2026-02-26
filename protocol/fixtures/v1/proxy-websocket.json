@@ -1,0 +1,27 @@
+[
+  {
+    "v": 1,
+    "type": "proxy.ws.upgrade",
+    "payload": {
+      "requestId": "ws1a2b3c",
+      "path": "/_hmr",
+      "port": 5173,
+      "headers": { "sec-websocket-protocol": "vite-hmr" }
+    }
+  },
+  {
+    "v": 1,
+    "type": "proxy.ws.open",
+    "payload": { "requestId": "ws1a2b3c" }
+  },
+  {
+    "v": 1,
+    "type": "proxy.ws.close",
+    "payload": { "requestId": "ws1a2b3c", "code": 1000, "reason": "Normal Closure" }
+  },
+  {
+    "v": 1,
+    "type": "proxy.ws.error",
+    "payload": { "requestId": "ws1a2b3c", "message": "Connection refused" }
+  }
+]

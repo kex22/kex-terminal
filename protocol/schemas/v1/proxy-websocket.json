@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://kex.sh/protocol/v1/proxy-websocket.json",
+  "definitions": {
+    "proxy.ws.upgrade": {
+      "type": "object",
+      "required": ["requestId", "path", "port", "headers"],
+      "properties": {
+        "requestId": { "type": "string" },
+        "path": { "type": "string" },
+        "port": { "type": "integer" },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "proxy.ws.open": {
+      "type": "object",
+      "required": ["requestId"],
+      "properties": {
+        "requestId": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "proxy.ws.close": {
+      "type": "object",
+      "required": ["requestId", "code", "reason"],
+      "properties": {
+        "requestId": { "type": "string" },
+        "code": { "type": "integer" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "proxy.ws.error": {
+      "type": "object",
+      "required": ["requestId", "message"],
+      "properties": {
+        "requestId": { "type": "string" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}
