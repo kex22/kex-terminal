@@ -115,6 +115,14 @@ fn fixture_proxy_response_validates() {
 }
 
 #[test]
+fn fixture_proxy_websocket_validates() {
+    let fixture = load_json(&format!("{}/proxy-websocket.json", fixture_dir()));
+    validate_fixture_envelope(&fixture);
+    let schema = load_json(&format!("{}/proxy-websocket.json", schema_dir()));
+    validate_fixture_payloads(&fixture, &schema);
+}
+
+#[test]
 fn all_fixtures_have_version_1() {
     let dir = Path::new(fixture_dir());
     for entry in fs::read_dir(dir).unwrap() {
