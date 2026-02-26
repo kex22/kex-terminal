@@ -79,3 +79,8 @@ impl ProxyState {
 /// Binary frame types for proxy data.
 pub const FRAME_PROXY_REQUEST_BODY: u8 = 0x20;
 pub const FRAME_PROXY_RESPONSE_BODY: u8 = 0x21;
+pub const FRAME_PROXY_WS_DATA: u8 = 0x22;
+
+/// WebSocket frame subtypes (first byte of payload after requestId).
+pub const WS_SUBTYPE_TEXT: u8 = 0x01;
+pub const WS_SUBTYPE_BINARY: u8 = 0x02;
