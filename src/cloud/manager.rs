@@ -395,6 +395,153 @@ impl CloudManager {
             .insert(request_id, proxy::PendingProxyRequest { port, handle });
     }
 
+    async fn handle_proxy_ws_upgrade(&mut self, payload: &serde_json::Value) {
+        let request_id = payload["requestId"].as_str().unwrap_or("").to_string();
+        let path = payload["path"].as_str().unwrap_or("/").to_string();
+        let port = payload["port"].as_u64().unwrap_or(0) as u16;
+
+        if port == 0 || request_id.is_empty() {
+            let msg = envelope(
+                "proxy.ws.error",
+                serde_json::json!({ "requestId": request_id, "message": "invalid port or requestId" }),
+            );
+            let _ = self.ws_send_text(&msg).await;
+            return;
+        }
+
+        let url = format!("ws://127.0.0.1:{port}{path}");
+        let proxy_tx = self.proxy_event_tx.clone();
+        let rid = request_id.clone();
+
+        let (ws_writer_tx, ws_writer_rx) = mpsc::channel::<proxy::WsWriteMsg>(64);
+        let (write_half_tx, write_half_rx) = tokio::sync::oneshot::channel();
+
+        // Reader/connector task: connect → send WsOpen → read loop
+        let reader_tx = proxy_tx.clone();
+        let reader_rid = rid.clone();
+        let reader_handle = tokio::spawn(async move {
+            let connect_result = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio_tungstenite::connect_async(&url),
+            )
+            .await;
+
+            let ws_stream = match connect_result {
+                Ok(Ok((stream, _))) => stream,
+                Ok(Err(e)) => {
+                    let _ = reader_tx
+                        .send(ProxyEvent::WsError {
+                            request_id: reader_rid,
+                            message: format!("WS connect failed: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = reader_tx
+                        .send(ProxyEvent::WsError {
+                            request_id: reader_rid,
+                            message: "WS connect timeout".into(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            // Connected — notify D.O.
+            let _ = reader_tx
+                .send(ProxyEvent::WsOpen {
+                    request_id: reader_rid.clone(),
+                })
+                .await;
+
+            let (write_half, mut read_half) = futures_util::StreamExt::split(ws_stream);
+            // Pass write half to writer task
+            let _ = write_half_tx.send(write_half);
+
+            // Read loop: localhost WS → ProxyEvent
+            while let Some(msg) = futures_util::StreamExt::next(&mut read_half).await {
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        let _ = reader_tx
+                            .send(ProxyEvent::WsData {
+                                request_id: reader_rid.clone(),
+                                is_text: true,
+                                data: text.as_bytes().to_vec(),
+                            })
+                            .await;
+                    }
+                    Ok(Message::Binary(bin)) => {
+                        let _ = reader_tx
+                            .send(ProxyEvent::WsData {
+                                request_id: reader_rid.clone(),
+                                is_text: false,
+                                data: bin.to_vec(),
+                            })
+                            .await;
+                    }
+                    Ok(Message::Close(frame)) => {
+                        let (code, reason) = frame
+                            .map(|f| (f.code.into(), f.reason.to_string()))
+                            .unwrap_or((1000, String::new()));
+                        let _ = reader_tx
+                            .send(ProxyEvent::WsClose {
+                                request_id: reader_rid.clone(),
+                                code,
+                                reason,
+                            })
+                            .await;
+                        break;
+                    }
+                    Err(_) => break,
+                    _ => {} // Ping/Pong handled by tungstenite
+                }
+            }
+        });
+
+        // Writer task: mpsc channel → localhost WS
+        let writer_handle = tokio::spawn(async move {
+            let Ok(mut write_half) = write_half_rx.await else {
+                return;
+            };
+            let mut rx = ws_writer_rx;
+            while let Some(msg) = rx.recv().await {
+                let ws_msg = match msg {
+                    proxy::WsWriteMsg::Data { is_text, payload } => {
+                        if is_text {
+                            Message::Text(String::from_utf8_lossy(&payload).into_owned().into())
+                        } else {
+                            Message::Binary(payload.into())
+                        }
+                    }
+                    proxy::WsWriteMsg::Close { code, reason } => {
+                        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+                        Message::Close(Some(CloseFrame {
+                            code: code.into(),
+                            reason: reason.into(),
+                        }))
+                    }
+                };
+                if futures_util::SinkExt::send(&mut write_half, ws_msg)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        self.proxy.pending_ws.insert(
+            request_id,
+            proxy::PendingWsProxy {
+                port,
+                reader_handle,
+                writer_handle,
+                writer_tx: ws_writer_tx,
+            },
+        );
+    }
+
     /// Ensure connected, send message, wait for confirmation response.
     async fn send_and_confirm(
         &mut self,
@@ -774,6 +921,24 @@ impl CloudManager {
                 let request_id = msg["payload"]["requestId"].as_str().unwrap_or("");
                 self.proxy.cancel_request(request_id);
             }
+            "proxy.ws.upgrade" => {
+                self.handle_proxy_ws_upgrade(&msg["payload"]).await;
+            }
+            "proxy.ws.close" => {
+                let request_id = msg["payload"]["requestId"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let code = msg["payload"]["code"].as_u64().unwrap_or(1000) as u16;
+                let reason = msg["payload"]["reason"].as_str().unwrap_or("").to_string();
+                if let Some(ws) = self.proxy.pending_ws.get(&request_id) {
+                    let _ = ws
+                        .writer_tx
+                        .send(proxy::WsWriteMsg::Close { code, reason })
+                        .await;
+                }
+                self.proxy.cancel_ws(&request_id);
+            }
             _ => {}
         }
     }
@@ -887,6 +1052,20 @@ impl CloudManager {
             proxy::FRAME_PROXY_REQUEST_BODY => {
                 // POST/PUT request body streaming — Phase 5b+.
                 // For now, proxy tasks handle GET-only (no request body).
+            }
+            proxy::FRAME_PROXY_WS_DATA => {
+                if data.len() < 10 {
+                    return;
+                }
+                let subtype = data[9];
+                let payload = &data[10..];
+                let is_text = subtype == proxy::WS_SUBTYPE_TEXT;
+                if let Some(ws) = self.proxy.pending_ws.get(tid) {
+                    let _ = ws.writer_tx.try_send(proxy::WsWriteMsg::Data {
+                        is_text,
+                        payload: payload.to_vec(),
+                    });
+                }
             }
             _ => {}
         }
