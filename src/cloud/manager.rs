@@ -319,7 +319,7 @@ impl CloudManager {
             "proxy.expose",
             serde_json::json!({ "port": port, "public": public }),
         );
-        if let Err(_) = self.ws_send_text(&msg).await {
+        if self.ws_send_text(&msg).await.is_err() {
             if let Some(reply) = self.pending_expose.remove(&port) {
                 let _ = reply.send(Err("connection lost".into())).await;
             }
