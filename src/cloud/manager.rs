@@ -48,8 +48,9 @@ enum TerminalEvent {
     Exited { id: String },
 }
 
-/// Internal events from proxy tasks (localhost HTTP responses).
-enum ProxyEvent {
+/// Events from proxy tasks (localhost HTTP responses).
+#[doc(hidden)]
+pub enum ProxyEvent {
     Head {
         request_id: String,
         status: u16,
@@ -1131,7 +1132,8 @@ fn spawn_pty_reader(
 
 /// Spawn a tokio task that connects to localhost and streams the response back
 /// via the proxy event channel.
-async fn proxy_request_task(
+#[doc(hidden)]
+pub async fn proxy_request_task(
     request_id: String,
     method: String,
     port: u16,
@@ -1233,7 +1235,8 @@ async fn proxy_request_task(
 
 /// Encode a WebSocket binary frame: [1B type][8B terminal_id][payload].
 /// No length prefix — WebSocket messages are self-delimited.
-fn encode_binary_frame(id: &str, frame_type: u8, payload: &[u8]) -> Vec<u8> {
+#[doc(hidden)]
+pub fn encode_binary_frame(id: &str, frame_type: u8, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(9 + payload.len());
     buf.push(frame_type);
     let mut id_fixed = [0u8; 8];
@@ -1257,7 +1260,8 @@ fn encode_ws_binary_frame(id: &str, subtype: u8, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-fn envelope(msg_type: &str, payload: serde_json::Value) -> String {
+#[doc(hidden)]
+pub fn envelope(msg_type: &str, payload: serde_json::Value) -> String {
     serde_json::json!({ "v": 1, "type": msg_type, "payload": payload }).to_string()
 }
 
