@@ -140,6 +140,73 @@ async fn contract_proxy_http_happy_path() {
     assert_eq!(expected_status, 200);
 }
 
+#[tokio::test]
+async fn contract_proxy_http_connection_refused() {
+    let scenario = load_scenario("proxy-http-connection-refused.json");
+
+    // Extract request params from do→cli request.head step
+    let do_to_cli = contract::filter_steps(&scenario, "do→cli");
+    let head_step = do_to_cli
+        .iter()
+        .find(|s| {
+            s.message
+                .as_ref()
+                .is_some_and(|m| m["type"] == "proxy.request.head")
+        })
+        .expect("scenario missing proxy.request.head step");
+    let head_msg = head_step.message.as_ref().unwrap();
+    let method = head_msg["payload"]["method"].as_str().unwrap().to_string();
+    let path = head_msg["payload"]["path"].as_str().unwrap().to_string();
+    let request_id = head_msg["payload"]["requestId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Use a port that nothing is listening on
+    let (tx, mut rx) = mpsc::channel::<ProxyEvent>(32);
+    let client = reqwest::Client::new();
+
+    proxy_request_task(
+        request_id.clone(),
+        method,
+        19999, // no server on this port
+        path,
+        HashMap::new(),
+        tx,
+        client,
+    )
+    .await;
+
+    // Collect events
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+
+    // Should get exactly one Error event
+    assert!(!events.is_empty(), "expected at least one event");
+    match &events[0] {
+        ProxyEvent::Error {
+            request_id: rid,
+            message,
+        } => {
+            assert_eq!(rid, &request_id);
+            // Verify message matches scenario assertion
+            let cli_assertions = &scenario.assertions["cli"];
+            let expected_contains = cli_assertions["error_sent"]["message_contains"]
+                .as_str()
+                .unwrap();
+            assert!(
+                message.contains(expected_contains),
+                "error message '{}' should contain '{}'",
+                message,
+                expected_contains
+            );
+        }
+        other => panic!("expected Error event, got {:?}", event_type_name(other)),
+    }
+}
+
 fn event_type_name(event: &ProxyEvent) -> &'static str {
     match event {
         ProxyEvent::Head { .. } => "Head",
