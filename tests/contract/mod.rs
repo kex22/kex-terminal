@@ -1,10 +1,8 @@
 mod proxy_test;
 mod terminal_test;
 
-use crate::support::{BinaryStep, Scenario, ScenarioStep};
-use kex::cloud::manager::ProxyEvent;
+use crate::support::{Scenario, ScenarioStep};
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// Filter scenario steps by direction.
 pub fn filter_steps<'a>(scenario: &'a Scenario, direction: &str) -> Vec<&'a ScenarioStep> {
@@ -13,68 +11,6 @@ pub fn filter_steps<'a>(scenario: &'a Scenario, direction: &str) -> Vec<&'a Scen
         .iter()
         .filter(|s| s.direction == direction)
         .collect()
-}
-
-/// Convert a ProxyEvent into a JSON Value matching the scenario message format.
-pub fn proxy_event_to_message(event: &ProxyEvent) -> Option<Value> {
-    match event {
-        ProxyEvent::Head {
-            request_id,
-            status,
-            headers,
-        } => {
-            let hdr_json: serde_json::Map<String, Value> = headers
-                .iter()
-                .map(|(k, v): (&String, &Vec<String>)| {
-                    let val = if v.len() == 1 {
-                        Value::String(v[0].clone())
-                    } else {
-                        Value::Array(
-                            v.iter()
-                                .map(|s: &String| Value::String(s.clone()))
-                                .collect(),
-                        )
-                    };
-                    (k.clone(), val)
-                })
-                .collect();
-            Some(serde_json::json!({
-                "v": 1,
-                "type": "proxy.response.head",
-                "payload": {
-                    "requestId": request_id,
-                    "status": status,
-                    "headers": hdr_json,
-                }
-            }))
-        }
-        ProxyEvent::End { request_id } => Some(serde_json::json!({
-            "v": 1,
-            "type": "proxy.response.end",
-            "payload": { "requestId": request_id }
-        })),
-        ProxyEvent::Error {
-            request_id,
-            message,
-        } => Some(serde_json::json!({
-            "v": 1,
-            "type": "proxy.response.error",
-            "payload": { "requestId": request_id, "message": message }
-        })),
-        ProxyEvent::Body { .. } => None, // binary frame, handled separately
-        _ => None,
-    }
-}
-
-/// Build a binary frame from a scenario BinaryStep.
-pub fn binary_step_to_frame(step: &BinaryStep) -> Vec<u8> {
-    use base64::Engine;
-    let frame_type = u8::from_str_radix(step.frame_type.trim_start_matches("0x"), 16)
-        .expect("invalid frameType hex");
-    let payload = base64::engine::general_purpose::STANDARD
-        .decode(&step.payload_base64)
-        .expect("invalid base64 payload");
-    kex::cloud::manager::encode_binary_frame(&step.id, frame_type, &payload)
 }
 
 /// Assert that an actual JSON message matches an expected scenario message,
