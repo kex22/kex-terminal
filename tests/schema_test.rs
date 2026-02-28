@@ -1,3 +1,5 @@
+mod support;
+
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -120,6 +122,22 @@ fn fixture_proxy_websocket_validates() {
     validate_fixture_envelope(&fixture);
     let schema = load_json(&format!("{}/proxy-websocket.json", schema_dir()));
     validate_fixture_payloads(&fixture, &schema);
+}
+
+#[test]
+fn scenario_loader_parses_valid_file() {
+    let s = support::load_scenario("_loader-test.json");
+    assert_eq!(s.name, "minimal test");
+    assert_eq!(s.steps.len(), 1);
+    assert_eq!(s.steps[0].direction, "cli→do");
+    assert!(s.steps[0].message.is_some());
+    assert!(s.steps[0].binary.is_none());
+}
+
+#[test]
+#[should_panic(expected = "Failed to load scenario")]
+fn scenario_loader_panics_on_missing_file() {
+    support::load_scenario("nonexistent.json");
 }
 
 #[test]

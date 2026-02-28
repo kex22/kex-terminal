@@ -1,0 +1,30 @@
+{
+  "name": "Terminal sync happy path",
+  "description": "sync terminal → binary frame output → binary frame input",
+  "steps": [
+    {
+      "direction": "cli→do",
+      "message": { "v": 1, "type": "terminal.sync", "payload": { "terminalId": "a1b2c3d4", "name": "dev" } }
+    },
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "terminal.sync.ok", "payload": { "terminalId": "a1b2c3d4" } }
+    },
+    {
+      "direction": "cli→do",
+      "binary": { "frameType": "0x01", "id": "a1b2c3d4", "payload_base64": "aGVsbG8gd29ybGQ=" }
+    },
+    {
+      "direction": "do→cli",
+      "binary": { "frameType": "0x01", "id": "a1b2c3d4", "payload_base64": "bHMgLWxhCg==" }
+    }
+  ],
+  "assertions": {
+    "cli": {
+      "terminal_synced": { "id": "a1b2c3d4", "name": "dev" }
+    },
+    "do": {
+      "terminal_output_received": { "id": "a1b2c3d4", "payload_base64": "aGVsbG8gd29ybGQ=" }
+    }
+  }
+}

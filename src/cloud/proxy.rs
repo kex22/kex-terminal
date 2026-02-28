@@ -124,6 +124,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn expose_adds_port() {
+        let mut state = ProxyState::new();
+        state.expose(3000, false);
+        assert!(state.exposed_ports.contains_key(&3000));
+        assert!(!state.exposed_ports[&3000].public);
+        assert!(state.exposed_ports[&3000].url.is_none());
+    }
+
+    #[test]
+    fn expose_public_flag() {
+        let mut state = ProxyState::new();
+        state.expose(8080, true);
+        assert!(state.exposed_ports[&8080].public);
+    }
+
+    #[test]
+    fn unexpose_removes_port() {
+        let mut state = ProxyState::new();
+        state.expose(3000, false);
+        assert!(state.unexpose(3000));
+        assert!(state.exposed_ports.is_empty());
+    }
+
+    #[test]
+    fn unexpose_nonexistent_returns_false() {
+        let mut state = ProxyState::new();
+        assert!(!state.unexpose(9999));
+    }
+
+    #[test]
     fn ws_frame_constants() {
         assert_eq!(FRAME_PROXY_WS_DATA, 0x22);
         assert_eq!(WS_SUBTYPE_TEXT, 0x01);
@@ -179,5 +209,67 @@ mod tests {
         assert_eq!(state.pending_ws.len(), 3);
         state.cancel_all_ws();
         assert_eq!(state.pending_ws.len(), 0);
+    }
+
+    #[test]
+    fn set_url_updates_exposed_port() {
+        let mut state = ProxyState::new();
+        state.expose(3000, false);
+        state.set_url(3000, "https://example.com/p/3000/".into());
+        assert_eq!(
+            state.exposed_ports[&3000].url.as_deref(),
+            Some("https://example.com/p/3000/")
+        );
+    }
+
+    #[test]
+    fn set_url_nonexistent_port_is_noop() {
+        let mut state = ProxyState::new();
+        state.set_url(9999, "https://example.com".into());
+        assert!(state.exposed_ports.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_request_aborts_handle() {
+        let mut state = ProxyState::new();
+        let handle =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .pending_requests
+            .insert("req1".into(), PendingProxyRequest { port: 3000, handle });
+        state.cancel_request("req1");
+        assert!(state.pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_all_requests_clears_all_and_ws() {
+        let mut state = ProxyState::new();
+        for i in 0..3 {
+            let handle = tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await
+            });
+            state.pending_requests.insert(
+                format!("req{i}"),
+                PendingProxyRequest { port: 3000, handle },
+            );
+        }
+        let reader =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        let writer =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        state.pending_ws.insert(
+            "ws1".into(),
+            PendingWsProxy {
+                port: 3000,
+                reader_handle: reader,
+                writer_handle: writer,
+                writer_tx: tx,
+            },
+        );
+
+        state.cancel_all_requests();
+        assert!(state.pending_requests.is_empty());
+        assert!(state.pending_ws.is_empty());
     }
 }

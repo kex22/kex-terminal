@@ -1594,6 +1594,75 @@ mod tests {
         // No panic = success (no WS to send to, silently drops)
     }
 
+    #[tokio::test]
+    async fn proxy_event_end_removes_pending() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let (proxy_event_tx, proxy_event_rx) = mpsc::channel(1);
+        let mut mgr = CloudManager {
+            rx: mpsc::channel(1).1,
+            event_rx,
+            event_tx,
+            synced: Arc::new(Mutex::new(HashSet::new())),
+            terminals: HashMap::new(),
+            manager: test_manager(),
+            ws_read: None,
+            ws_write: None,
+            backoff: Duration::from_secs(1),
+            disconnect_at: None,
+            proxy: ProxyState::new(),
+            pending_expose: HashMap::new(),
+            proxy_event_tx,
+            proxy_event_rx,
+        };
+
+        let handle = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+        mgr.proxy.pending_requests.insert(
+            "req1".into(),
+            proxy::PendingProxyRequest { port: 3000, handle },
+        );
+
+        mgr.handle_proxy_event(ProxyEvent::End {
+            request_id: "req1".into(),
+        })
+        .await;
+        assert!(mgr.proxy.pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_event_error_removes_pending() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let (proxy_event_tx, proxy_event_rx) = mpsc::channel(1);
+        let mut mgr = CloudManager {
+            rx: mpsc::channel(1).1,
+            event_rx,
+            event_tx,
+            synced: Arc::new(Mutex::new(HashSet::new())),
+            terminals: HashMap::new(),
+            manager: test_manager(),
+            ws_read: None,
+            ws_write: None,
+            backoff: Duration::from_secs(1),
+            disconnect_at: None,
+            proxy: ProxyState::new(),
+            pending_expose: HashMap::new(),
+            proxy_event_tx,
+            proxy_event_rx,
+        };
+
+        let handle = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+        mgr.proxy.pending_requests.insert(
+            "req1".into(),
+            proxy::PendingProxyRequest { port: 3000, handle },
+        );
+
+        mgr.handle_proxy_event(ProxyEvent::Error {
+            request_id: "req1".into(),
+            message: "connection refused".into(),
+        })
+        .await;
+        assert!(mgr.proxy.pending_requests.is_empty());
+    }
+
     #[test]
     fn proxy_state_expose_unexpose() {
         let mut state = ProxyState::new();

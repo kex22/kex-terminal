@@ -1,0 +1,14 @@
+{
+  "name": "minimal test",
+  "description": "Minimal scenario for loader testing",
+  "steps": [
+    {
+      "direction": "cli→do",
+      "message": { "v": 1, "type": "proxy.expose", "payload": { "port": 3000, "public": false } }
+    }
+  ],
+  "assertions": {
+    "cli": {},
+    "do": {}
+  }
+}

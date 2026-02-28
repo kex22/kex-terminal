@@ -1,0 +1,42 @@
+{
+  "name": "HTTP proxy happy path",
+  "description": "expose port → GET request → 200 response with body",
+  "steps": [
+    {
+      "direction": "cli→do",
+      "message": { "v": 1, "type": "proxy.expose", "payload": { "port": 3000, "public": false } }
+    },
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "proxy.expose.ok", "payload": { "port": 3000, "url": "https://app.kex.sh/@alice/devices/dev1/p/3000/" } }
+    },
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "proxy.request.head", "payload": { "requestId": "abc12345", "method": "GET", "path": "/api/users", "port": 3000, "headers": { "accept": "application/json" } } }
+    },
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "proxy.request.end", "payload": { "requestId": "abc12345" } }
+    },
+    {
+      "direction": "cli→do",
+      "message": { "v": 1, "type": "proxy.response.head", "payload": { "requestId": "abc12345", "status": 200, "headers": { "content-type": "application/json" } } }
+    },
+    {
+      "direction": "cli→do",
+      "binary": { "frameType": "0x21", "id": "abc12345", "payload_base64": "eyJ1c2VycyI6W119" }
+    },
+    {
+      "direction": "cli→do",
+      "message": { "v": 1, "type": "proxy.response.end", "payload": { "requestId": "abc12345" } }
+    }
+  ],
+  "assertions": {
+    "cli": {
+      "http_request_made": { "method": "GET", "url": "http://localhost:3000/api/users" }
+    },
+    "do": {
+      "http_response": { "status": 200, "headers": { "content-type": "application/json" }, "body_base64": "eyJ1c2VycyI6W119" }
+    }
+  }
+}
