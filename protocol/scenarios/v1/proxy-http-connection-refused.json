@@ -1,0 +1,34 @@
+{
+  "name": "HTTP proxy connection refused",
+  "description": "expose port → request → localhost unreachable → proxy.response.error",
+  "steps": [
+    {
+      "direction": "cli→do",
+      "message": { "v": 1, "type": "proxy.expose", "payload": { "port": 9999, "public": false } }
+    },
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "proxy.expose.ok", "payload": { "port": 9999, "url": "https://app.kex.sh/@alice/devices/dev1/p/9999/" } }
+    },
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "proxy.request.head", "payload": { "requestId": "err-conn-1", "method": "GET", "path": "/", "port": 9999, "headers": {} } }
+    },
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "proxy.request.end", "payload": { "requestId": "err-conn-1" } }
+    },
+    {
+      "direction": "cli→do",
+      "message": { "v": 1, "type": "proxy.response.error", "payload": { "requestId": "err-conn-1", "message": "localhost connection failed" } }
+    }
+  ],
+  "assertions": {
+    "cli": {
+      "error_sent": { "requestId": "err-conn-1", "message_contains": "connection failed" }
+    },
+    "do": {
+      "http_response": { "status": 502, "error_code": "proxy_error" }
+    }
+  }
+}

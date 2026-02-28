@@ -1,0 +1,22 @@
+{
+  "name": "HTTP proxy timeout",
+  "description": "expose port → request → CLI silent → 30s timeout → 504",
+  "steps": [
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "proxy.request.head", "payload": { "requestId": "err-timeout-1", "method": "GET", "path": "/slow", "port": 3000, "headers": {} } }
+    },
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "proxy.request.end", "payload": { "requestId": "err-timeout-1" } }
+    }
+  ],
+  "assertions": {
+    "cli": {
+      "no_response": true
+    },
+    "do": {
+      "http_response": { "status": 504, "error_code": "gateway_timeout" }
+    }
+  }
+}

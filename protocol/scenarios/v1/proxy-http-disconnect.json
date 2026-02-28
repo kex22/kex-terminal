@@ -1,0 +1,22 @@
+{
+  "name": "HTTP proxy CLI disconnect",
+  "description": "request in flight → CLI WebSocket closes → pending requests aborted → 502",
+  "steps": [
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "proxy.request.head", "payload": { "requestId": "err-disc-1", "method": "GET", "path": "/api", "port": 3000, "headers": {} } }
+    },
+    {
+      "direction": "do→cli",
+      "message": { "v": 1, "type": "proxy.request.end", "payload": { "requestId": "err-disc-1" } }
+    }
+  ],
+  "assertions": {
+    "cli": {
+      "disconnected": true
+    },
+    "do": {
+      "http_response": { "status": 502, "error_code": "proxy_error" }
+    }
+  }
+}
